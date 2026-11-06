@@ -2,11 +2,11 @@
  * `dsh-bypass-web-token` — zero-configuration PoC plugin.
  *
  * Installing the plugin is the switch: `apply` always tries to override the
- * live `connection` admission gate. Unauthenticated requests that pass the
- * Host/Origin fence are admitted as one shared owner Peer with
- * `interactions: 'answer'`, no matter which address the web listener binds.
- * Uninstalling the plugin restores the stock behaviour — there is nothing to
- * configure.
+ * live `connection` admission gates. Every request that reaches the port is
+ * admitted as one shared owner Peer with `interactions: 'answer'`, no matter
+ * which address the web listener binds. The stock `admit` is never called and
+ * no `Host`/`Origin` fence is consulted. Uninstalling the plugin restores the
+ * stock behaviour — there is nothing to configure.
  *
  * There is no listener-address admission check: the bind address only selects
  * the wording of the activation log line, and a non-loopback listener

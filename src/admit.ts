@@ -1,5 +1,5 @@
 /**
- * Runtime replacement of the Host Connection admission gate.
+ * Runtime replacement of the Host Connection admission gates.
  *
  * We deliberately do NOT import (or patch) the `HostConnectionService` class:
  * a plugin linked into a profile can end up with a different module instance
@@ -9,20 +9,24 @@
  * `/api` route, the WebSocket upgrade) dispatches through `this.admit(...)`, so
  * an own property on the instance shadows the prototype method.
  *
- * The web UI shell is gated on a second, independent path:
- * `dsh-host-frontend-static` calls `ctx.connection.authorizeIndex(req, res)`
- * before it serves `index.html`, and `BrowserAuth.authorizeIndex` answers `401`
- * without a `?token=…` query or a session cookie. That method is an own
- * property of the instance for the same reason as `admit`, so both gates are
- * overridden together.
+ * This plugin is a bypass, not an auth extension: the override never calls the
+ * stock `admit`, never consults `isTrusted`, and never looks at `Host` or
+ * `Origin`. Every request that reaches the port is answered with one shared
+ * anonymous `answer` peer, including cross-origin browser requests and forged
+ * `Host` headers.
+ *
+ * Two more gates are replaced on the same instance:
+ *   - `authorizeIndex` (web UI shell) returns `true` for every request.
+ *   - `authorizeConnect` (`/connect` launch-token exchange) skips the token
+ *     entirely and returns an empty `dsh-session` cookie in its 302.
  *
  * Robustness contract: nothing in this module ever throws to the caller. A
  * failed install logs one line and returns a no-op disposer; a failed request
  * logs once per distinct error signature and falls back to `{ rejection: 401 }`.
  * dsh therefore keeps running with its stock token authentication no matter
- * what shape the internal service has. A missing `authorizeIndex` is not fatal:
- * the `/api` and WebSocket gates are still patched and only the UI shell keeps
- * asking for a token.
+ * what shape the internal service has. A missing `authorizeIndex` or
+ * `authorizeConnect` is not fatal: the other gates are still patched and only
+ * the corresponding stock flow keeps asking for a token.
  */
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 
@@ -50,6 +54,12 @@ export interface PeerRecord {
   ownsSocket?: boolean
 }
 
+/** Interaction modes accepted by `/connect`. */
+export type ConnectionInteractions = 'answer' | 'none'
+
+/** Publisher signature used by the stock `authorizeConnect` instance method. */
+export type PublishPeer = (interactions: ConnectionInteractions) => string
+
 /**
  * The members of `HostConnectionService` this patch touches. `publishPeer` and
  * `peers` are private in the published types but are stable runtime members.
@@ -58,12 +68,28 @@ export interface PatchableConnection {
   admit(request: ConnectionTrustRequest): Admission
   /**
    * Index/UI gate used by `dsh-host-frontend-static`. Optional because a dsh
-   * build without the frontend (or a renamed member) must not block the
-   * `/api` patch.
+   * build without the frontend (or a renamed member) must not block the other
+   * gates.
    */
   authorizeIndex?(request: unknown, response: unknown): boolean
-  isTrusted(request: ConnectionTrustRequest): boolean
-  publishPeer(interactions?: 'answer' | 'none'): string
+  /**
+   * `/connect` launch-token exchange. Optional for the same reason as
+   * `authorizeIndex`; the stock instance method takes `(request, response)`
+   * and publishes through `browserAuth`, while the browser-auth class method
+   * also accepts `(secure, publish)`.
+   */
+  authorizeConnect?(
+    request: unknown,
+    response: unknown,
+    secure?: boolean,
+    publish?: PublishPeer,
+  ): boolean | void
+  /**
+   * Kept as an optional type member for documentation only: the override never
+   * calls it, and a missing implementation does not block activation.
+   */
+  isTrusted?(request: ConnectionTrustRequest): boolean
+  publishPeer(interactions?: ConnectionInteractions): string
   peers: Map<string, PeerRecord>
   readonly disposed?: boolean
 }
@@ -95,24 +121,27 @@ export interface ConnectionProbeSuccess {
 /** Result of the non-throwing preflight probe. */
 export type ConnectionProbe = ConnectionProbeFailure | ConnectionProbeSuccess
 
+/** One patched instance method and everything needed to restore it. */
+interface MethodPatch<T> {
+  /** Whether this install owns the gate. */
+  readonly patched: boolean
+  /** Whether the member was already an own property at install time. */
+  readonly hadOwn: boolean
+  /** The member exactly as found at install time. */
+  readonly original: T | undefined
+}
+
 interface PatchState {
   refs: number
-  /** Whether `admit` was already an own property, i.e. someone else patched it. */
-  hadOwn: boolean
-  /** The method exactly as found at install time (own function or prototype). */
-  originalOwn: AdmitMethod
-  /** Whether the index gate was overridden by this install. */
-  indexPatched: boolean
-  /** Whether `authorizeIndex` was already an own property at install time. */
-  hadOwnIndex: boolean
-  /** The index gate exactly as found at install time, when it was patched. */
-  originalIndexOwn: AuthorizeIndexMethod | undefined
+  readonly admit: MethodPatch<AdmitMethod>
+  readonly index: MethodPatch<AuthorizeIndexMethod>
+  readonly connect: MethodPatch<AuthorizeConnectMethod>
   peerId: string | undefined
   /** Last runtime error signature, used to throttle repeated request logs. */
   lastErrorKey: string | undefined
 }
 
-/** `admit` with its receiver typed, so the wrapper can `call` the original. */
+/** `admit` with its receiver typed, kept for exact restoration. */
 type AdmitMethod = (
   this: PatchableConnection,
   request: ConnectionTrustRequest,
@@ -124,6 +153,15 @@ type AuthorizeIndexMethod = (
   request: unknown,
   response: unknown,
 ) => boolean
+
+/** `authorizeConnect` with its receiver typed, kept for exact restoration. */
+type AuthorizeConnectMethod = (
+  this: PatchableConnection,
+  request: unknown,
+  response: unknown,
+  secure?: boolean,
+  publish?: PublishPeer,
+) => boolean | void
 
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
 const STATE = Symbol.for('dsh-bypass-web-token/patch-state')
@@ -150,6 +188,17 @@ export function requestDegraded(stage: string, detail: string): string {
 export function indexGateMissing(detail?: string): string {
   const suffix = detail === undefined ? '' : ` (${detail})`
   return `${LOG_PREFIX} WARNING: connection.authorizeIndex is missing — the web UI will still require a token${suffix}`
+}
+
+/**
+ * Format the warning shown when the `/connect` gate cannot be overridden.
+ *
+ * Like {@link indexGateMissing}, this is not fatal: the `/api` and WebSocket
+ * gates still work, only the `/connect` launch-token exchange stays stock.
+ */
+export function connectGateMissing(detail?: string): string {
+  const suffix = detail === undefined ? '' : ` (${detail})`
+  return `${LOG_PREFIX} WARNING: connection.authorizeConnect is missing — /connect will still require a launch token${suffix}`
 }
 
 /** Message extraction that cannot throw on exotic thrown values. */
@@ -251,9 +300,11 @@ function describeValue(value: unknown): string {
 /**
  * Non-throwing preflight for the runtime members the patch depends on.
  *
- * The published type promises all of these, but a dsh upgrade can rename or
- * hide an internal symbol. Returning a structured result (instead of throwing)
- * lets `apply` log exactly which member broke and stay inert.
+ * The published type promises these, but a dsh upgrade can rename or hide an
+ * internal symbol. Returning a structured result (instead of throwing) lets
+ * `apply` log exactly which member broke and stay inert.
+ *
+ * `isTrusted` is deliberately not required: the bypass never calls it.
  *
  * @param connection - value returned by `ctx.get('connection')`.
  * @returns `{ ok: true, connection }` or `{ ok: false, stage, detail }`.
@@ -287,14 +338,6 @@ function inspectConnection(connection: unknown): ConnectionProbe {
       ok: false,
       stage: 'connection.admit',
       detail: `expected a function, got ${describeValue(candidate.admit)}`,
-    }
-  }
-
-  if (typeof candidate.isTrusted !== 'function') {
-    return {
-      ok: false,
-      stage: 'connection.isTrusted',
-      detail: `expected a function, got ${describeValue(candidate.isTrusted)}`,
     }
   }
 
@@ -333,20 +376,20 @@ export interface InstallResult {
 }
 
 /**
- * Install the anonymous admission override exactly once per connection
- * instance. Repeated installs only bump a reference count, so an HMR reload or
- * a second apply cannot wrap the wrapper.
+ * Install the bypass gates exactly once per connection instance. Repeated
+ * installs only bump a reference count, so an HMR reload or a second apply
+ * cannot wrap the wrapper.
  *
- * This function never throws. When the preflight fails or the property cannot
- * be written (frozen/read-only instance), it logs one `activation skipped`
- * line and returns a no-op disposer, leaving the stock admission intact.
+ * This function never throws. When the preflight fails or a property cannot be
+ * written (frozen/read-only instance), it logs one `activation skipped` line
+ * and returns a no-op disposer, leaving the stock admission intact.
  *
  * Compatibility wrapper around {@link installAnonymousAdmitResult}; callers
  * that need to know whether the patch really landed must use the latter.
  *
  * @param connection - live `ctx.get('connection')` service instance.
  * @param options - optional diagnostics sink (retained for compatibility).
- * @returns idempotent disposer restoring the original admission behaviour.
+ * @returns idempotent disposer restoring the original behaviour.
  */
 export function installAnonymousAdmit(
   connection: PatchableConnection,
@@ -398,14 +441,16 @@ export function installAnonymousAdmitResult(
     return { dispose: makeDisposer(patched, existing), installed: true }
   }
 
-  let hadOwn: boolean
-  let originalOwn: AdmitMethod
+  let admitPatch: MethodPatch<AdmitMethod>
   try {
-    hadOwn = Object.hasOwn(patched, 'admit')
-    // Keep the exact function that was there. `bind` would produce a copy, and
-    // writing that copy back on uninstall would break identity with the
-    // original own property; calling with `patched` covers inherited methods.
-    originalOwn = patched.admit as AdmitMethod
+    admitPatch = {
+      patched: true,
+      hadOwn: Object.hasOwn(patched, 'admit'),
+      // Keep the exact function that was there. `bind` would produce a copy,
+      // and writing that copy back on uninstall would break identity with the
+      // original own property; calling with `patched` covers inherited methods.
+      original: patched.admit as AdmitMethod,
+    }
   } catch (error) {
     safeError(
       activationSkipped(
@@ -418,7 +463,7 @@ export function installAnonymousAdmitResult(
 
   // The UI shell has its own gate (`dsh-host-frontend-static` asks
   // `connection.authorizeIndex`). It is patched on a best-effort basis: a dsh
-  // build without it must not lose the `/api` and WebSocket override.
+  // build without it must not lose the other overrides.
   let indexMethod: AuthorizeIndexMethod | undefined
   let indexReadDetail: string | undefined
   let hadOwnIndex = false
@@ -433,13 +478,35 @@ export function installAnonymousAdmitResult(
   }
   if (indexMethod === undefined) safeWarn(indexGateMissing(indexReadDetail))
 
+  // `/connect` is a launch-token exchange in stock dsh; the bypass answers it
+  // without ever reading the token. Also best-effort.
+  let connectMethod: AuthorizeConnectMethod | undefined
+  let connectReadDetail: string | undefined
+  let hadOwnConnect = false
+  try {
+    const candidateConnect = (patched as { authorizeConnect?: unknown }).authorizeConnect
+    if (typeof candidateConnect === 'function') {
+      hadOwnConnect = Object.hasOwn(patched, 'authorizeConnect')
+      connectMethod = candidateConnect as AuthorizeConnectMethod
+    }
+  } catch (error) {
+    connectReadDetail = `could not read connection.authorizeConnect: ${describeError(error)}`
+  }
+  if (connectMethod === undefined) safeWarn(connectGateMissing(connectReadDetail))
+
   const state: PatchState = {
     refs: 1,
-    hadOwn,
-    originalOwn,
-    indexPatched: indexMethod !== undefined,
-    hadOwnIndex,
-    originalIndexOwn: indexMethod,
+    admit: admitPatch,
+    index: {
+      patched: indexMethod !== undefined,
+      hadOwn: hadOwnIndex,
+      original: indexMethod,
+    },
+    connect: {
+      patched: connectMethod !== undefined,
+      hadOwn: hadOwnConnect,
+      original: connectMethod,
+    },
     peerId: undefined,
     lastErrorKey: undefined,
   }
@@ -455,41 +522,23 @@ export function installAnonymousAdmitResult(
     return { rejection: 401 }
   }
 
-  const admit = (request: ConnectionTrustRequest): Admission => {
-    // 1. The stock gate runs first: a real browser/API credential always wins.
-    let admission: Admission
-    try {
-      admission = originalOwn.call(patched, request)
-    } catch (error) {
-      return degrade('admit', error)
-    }
-    if (admission === null || typeof admission !== 'object') {
-      return degrade(
-        'admit',
-        new TypeError(`unexpected admission result: ${describeValue(admission)}`),
-      )
-    }
-    if ('peer' in admission) return admission
-
-    // 2. A disposing host must not mint new Peers.
+  /**
+   * The entire admission decision. No stock call, no Host/Origin fence.
+   *
+   * Order is fixed: a disposing host refuses; a cached peer record is reused
+   * while it exists; otherwise a fresh `answer` peer is published and returned.
+   */
+  const admit = (_request: ConnectionTrustRequest): Admission => {
+    // 1. A disposing host must not mint new Peers.
     let disposed: boolean
     try {
       disposed = patched.disposed === true
     } catch (error) {
       return degrade('disposed', error)
     }
-    if (disposed) return admission
+    if (disposed) return { rejection: 401 }
 
-    // 3. The Host/Origin fence is not optional.
-    let trusted: boolean
-    try {
-      trusted = patched.isTrusted.call(patched, request)
-    } catch (error) {
-      return degrade('isTrusted', error)
-    }
-    if (!trusted) return { rejection: 403 }
-
-    // 4. `admitConnection` looks the peer up by id and deletes it on socket
+    // 2. `admitConnection` looks the peer up by id and deletes it on socket
     //    close, so a released peer must be republished instead of reused.
     let record: PeerRecord | undefined
     try {
@@ -529,6 +578,95 @@ export function installAnonymousAdmitResult(
     }
   }
 
+  /** Best-effort `writeHead` + `end` that never escapes the wrapper. */
+  const respond = (
+    response: unknown,
+    status: number,
+    headers: Record<string, string>,
+    body?: string,
+  ): void => {
+    const res = response as
+      | { writeHead?: unknown; end?: unknown }
+      | null
+      | undefined
+    if (res === null || typeof res !== 'object') {
+      throw new TypeError(`response is ${describeValue(res)}`)
+    }
+    const writeHead = res.writeHead
+    const end = res.end
+    if (typeof writeHead !== 'function' || typeof end !== 'function') {
+      throw new TypeError('response does not expose writeHead/end')
+    }
+    ;(writeHead as (status: number, headers: Record<string, string>) => unknown).call(
+      res,
+      status,
+      headers,
+    )
+    if (body === undefined) (end as () => unknown).call(res)
+    else (end as (body: string) => unknown).call(res, body)
+  }
+
+  /**
+   * `/connect` bypass: keep the official query parsing and peer publication,
+   * drop the launch-token check, and hand back an empty session cookie.
+   */
+  const authorizeConnect = (
+    request: unknown,
+    response: unknown,
+    _secure?: boolean,
+    publish?: PublishPeer,
+  ): boolean | void => {
+    try {
+      const req = request as { url?: unknown; method?: unknown } | null
+      const rawUrl = req !== null && typeof req === 'object' ? req.url : undefined
+      const url = new URL(typeof rawUrl === 'string' ? rawUrl : '/', 'http://dsh.invalid')
+
+      const declarations = url.searchParams.getAll('interactions')
+      const interactions = declarations[0] ?? 'none'
+      if (
+        declarations.length > 1 ||
+        (interactions !== 'answer' && interactions !== 'none')
+      ) {
+        respond(
+          response,
+          400,
+          { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8' },
+          'interactions must be declared once as answer or none\n',
+        )
+        return
+      }
+
+      if (req?.method !== 'GET' || url.pathname !== '/connect') return false
+
+      const publisher: PublishPeer =
+        typeof publish === 'function'
+          ? publish
+          : (mode) => patched.publishPeer(mode)
+      publisher(interactions)
+
+      respond(response, 302, {
+        'cache-control': 'no-store',
+        location: './api/remote.mux',
+        'referrer-policy': 'no-referrer',
+        'set-cookie': 'dsh-session=; Path=/; HttpOnly; SameSite=Lax',
+      })
+      return
+    } catch (error) {
+      const detail = describeError(error)
+      const key = `authorizeConnect:${detail}`
+      if (state.lastErrorKey !== key) {
+        state.lastErrorKey = key
+        safeError(requestDegraded('authorizeConnect', detail))
+      }
+      try {
+        respond(response, 401, { 'cache-control': 'no-store' }, 'unauthorized')
+      } catch {
+        // The response may already be committed or unusable.
+      }
+      return false
+    }
+  }
+
   try {
     patched.admit = admit
     // The index gate answers `true` for every request: no token, no cookie, no
@@ -536,44 +674,47 @@ export function installAnonymousAdmitResult(
     if (indexMethod !== undefined) {
       ;(patched as { authorizeIndex?: unknown }).authorizeIndex = () => true
     }
+    if (connectMethod !== undefined) {
+      ;(patched as { authorizeConnect?: unknown }).authorizeConnect = authorizeConnect
+    }
     marked[STATE] = state
   } catch (error) {
     // Roll back anything that may have landed before the write failed, so a
     // half-installed patch cannot survive.
-    try {
-      if (hadOwn) patched.admit = originalOwn
-      else delete (patched as { admit?: unknown }).admit
-    } catch {
-      // Frozen/sealed instance: nothing was written in the first place.
-    }
-    if (indexMethod !== undefined) {
-      try {
-        // `indexMethod` is non-undefined exactly when this install owns the
-        // index gate, so the restoration mirror is safe in both branches.
-        if (hadOwnIndex) {
-          ;(patched as { authorizeIndex?: unknown }).authorizeIndex = indexMethod
-        } else {
-          delete (patched as { authorizeIndex?: unknown }).authorizeIndex
-        }
-      } catch {
-        // Same as above.
-      }
-    }
+    rollbackMethod(patched, 'admit', state.admit)
+    rollbackMethod(patched, 'authorizeIndex', state.index)
+    rollbackMethod(patched, 'authorizeConnect', state.connect)
     try {
       delete marked[STATE]
     } catch {
-      // Same as above.
+      // Frozen/sealed instance: nothing was written in the first place.
     }
     safeError(
       activationSkipped(
         'install',
-        `cannot patch the connection admission gate (frozen or read-only instance): ${describeError(error)}`,
+        `cannot patch the connection admission gates (frozen or read-only instance): ${describeError(error)}`,
       ),
     )
     return failed('install')
   }
 
   return { dispose: makeDisposer(patched, state), installed: true }
+}
+
+/** Restore one member to its exact pre-install shape; never throws. */
+function rollbackMethod<T>(
+  connection: PatchableConnection,
+  member: 'admit' | 'authorizeIndex' | 'authorizeConnect',
+  patch: MethodPatch<T>,
+): void {
+  if (!patch.patched) return
+  try {
+    const target = connection as unknown as Record<string, unknown>
+    if (patch.hadOwn) target[member] = patch.original
+    else delete target[member]
+  } catch {
+    // Frozen/sealed instance: the write never landed.
+  }
 }
 
 /** Build one idempotent, never-throwing disposer for a shared patch state. */
@@ -597,24 +738,9 @@ function makeDisposer(
         safeError(`${LOG_PREFIX} dispose degraded: state marker — ${describeError(error)}`)
       }
 
-      try {
-        if (state.hadOwn) connection.admit = state.originalOwn
-        else delete (connection as { admit?: unknown }).admit
-      } catch (error) {
-        safeError(`${LOG_PREFIX} dispose degraded: connection.admit — ${describeError(error)}`)
-      }
-
-      const originalIndexOwn = state.originalIndexOwn
-      if (state.indexPatched && originalIndexOwn !== undefined) {
-        try {
-          if (state.hadOwnIndex) connection.authorizeIndex = originalIndexOwn
-          else delete (connection as { authorizeIndex?: unknown }).authorizeIndex
-        } catch (error) {
-          safeError(
-            `${LOG_PREFIX} dispose degraded: connection.authorizeIndex — ${describeError(error)}`,
-          )
-        }
-      }
+      rollbackMethod(connection, 'admit', state.admit)
+      rollbackMethod(connection, 'authorizeIndex', state.index)
+      rollbackMethod(connection, 'authorizeConnect', state.connect)
 
       const peerId = state.peerId
       state.peerId = undefined

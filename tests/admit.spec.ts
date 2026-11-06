@@ -7,10 +7,19 @@ import {
   type PatchableConnection,
   type PeerLike,
   type PeerRecord,
+  type PublishPeer,
 } from '../src/admit.js'
 import { apply, Config, inject, name } from '../src/index.js'
 
 const request = { headers: {} } as ConnectionTrustRequest
+
+/** Request carrying a hostile Origin and a forged Host header. */
+const hostileRequest = {
+  headers: {
+    host: 'evil.example.com',
+    origin: 'http://evil.example.com',
+  },
+} as unknown as ConnectionTrustRequest
 
 /** Minimal stand-in for `HostConnectionService`'s admission surface. */
 class FakeConnection implements PatchableConnection {
@@ -21,12 +30,30 @@ class FakeConnection implements PatchableConnection {
   readonly published: Array<{ id: string; interactions: 'answer' | 'none' | undefined }> = []
   /** Every call the plugin let through to the stock index gate. */
   readonly indexCalls: Array<{ request: unknown; response: unknown }> = []
+  /** Every call the plugin let through to the stock /connect gate. */
+  readonly connectCalls: Array<{ request: unknown; response: unknown }> = []
   private seq = 0
 
   /** Stock `BrowserAuth.authorizeIndex`: refuses without a token or cookie. */
   authorizeIndex(request: unknown, response: unknown): boolean {
     this.indexCalls.push({ request, response })
     return false
+  }
+
+  /** Stock `/connect` exchange: requires a launch token. */
+  authorizeConnect(
+    request: unknown,
+    response: unknown,
+    _secure?: boolean,
+    _publish?: PublishPeer,
+  ): void {
+    this.connectCalls.push({ request, response })
+    const res = response as {
+      writeHead: (status: number, headers?: Record<string, string>) => void
+      end: (body?: string) => void
+    }
+    res.writeHead(401)
+    res.end('unauthorized')
   }
 
   admit(_request: ConnectionTrustRequest): Admission {
@@ -80,6 +107,19 @@ class FakeContext {
 
 const loopback = { host: '127.0.0.1' }
 
+/** Synthesize the request shape seen by `connection.authorizeConnect`. */
+function connectRequest(url: string, method = 'GET'): unknown {
+  return { url, method }
+}
+
+/** Minimal node:http response double for the `/connect` gate. */
+function fakeResponse(): {
+  writeHead: MockInstance<(status: number, headers?: Record<string, string>) => void>
+  end: MockInstance<(body?: string) => void>
+} {
+  return { writeHead: vi.fn(), end: vi.fn() }
+}
+
 let errorSpy: MockInstance<typeof console.error>
 let infoSpy: MockInstance<typeof console.info>
 let warnSpy: MockInstance<typeof console.warn>
@@ -112,20 +152,34 @@ function expectActivationSkipped(stage: string): void {
   expect(hit[0]).toContain('(plugin inactive; dsh keeps stock auth)')
 }
 
-/** Shared success assertions: patch landed, one disposer, exactly one info line. */
+/** Shared success assertions: all three gates landed and one info line was logged. */
 function expectActivated(ctx: FakeContext, connection: FakeConnection): void {
   expect(Object.hasOwn(connection, 'admit')).toBe(true)
   expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+  expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(true)
+
   expect(connection.authorizeIndex!(request, {})).toBe(true)
+  expect(connection.indexCalls).toHaveLength(0)
+
+  const response = fakeResponse()
+  const publish = vi.fn(() => 'published-by-connect')
+  connection.authorizeConnect!(connectRequest('/connect'), response, false, publish)
+  expect(publish).toHaveBeenCalledWith('none')
+  expect(response.writeHead).toHaveBeenCalledWith(
+    302,
+    expect.objectContaining({ location: './api/remote.mux' }),
+  )
+
   expect('peer' in connection.admit(request)).toBe(true)
   expect(ctx.cleanups).toHaveLength(1)
   expect(infoSpy).toHaveBeenCalledOnce()
 }
 
 describe('installAnonymousAdmit', () => {
-  it('admits an unauthenticated trusted request as an answering owner peer', () => {
+  it('admits an anonymous request without ever calling the stock admit', () => {
     captureConsole()
     const connection = new FakeConnection()
+    const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installAnonymousAdmit(connection)
 
     const admission = connection.admit(request)
@@ -135,31 +189,44 @@ describe('installAnonymousAdmit', () => {
     expect(admission.peer.id).toBe('peer-1')
     expect(admission.peer.interactions).toBe('answer')
     expect(connection.published).toEqual([{ id: 'peer-1', interactions: 'answer' }])
+    // The bypass replaces the gate instead of delegating to it.
+    expect(stockAdmit).not.toHaveBeenCalled()
 
     dispose()
   })
 
-  it('keeps the Host/Origin fence: untrusted requests still get 403', () => {
+  it('admits cross-origin / forged-Host requests instead of returning 403', () => {
     captureConsole()
     const connection = new FakeConnection()
     connection.trusted = false
+    const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installAnonymousAdmit(connection)
 
-    expect(connection.admit(request)).toEqual({ rejection: 403 })
-    expect(connection.published).toHaveLength(0)
+    const admission = connection.admit(hostileRequest)
+
+    expect('peer' in admission).toBe(true)
+    expect(stockAdmit).not.toHaveBeenCalled()
+    expect(connection.trusted).toBe(false)
+    expect(connection.published).toHaveLength(1)
 
     dispose()
   })
 
-  it('never downgrades an authenticated request', () => {
+  it('ignores an authenticated browser peer and returns the anonymous one', () => {
     captureConsole()
     const connection = new FakeConnection()
     const browserPeer: PeerLike = { id: 'browser-peer' }
     connection.authenticated = browserPeer
+    const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installAnonymousAdmit(connection)
 
-    expect(connection.admit(request)).toEqual({ peer: browserPeer })
-    expect(connection.published).toHaveLength(0)
+    const admission = connection.admit(request)
+
+    expect('peer' in admission).toBe(true)
+    if (!('peer' in admission)) throw new Error('expected a peer')
+    expect(admission.peer.id).toBe('peer-1')
+    expect(admission.peer).not.toBe(browserPeer)
+    expect(stockAdmit).not.toHaveBeenCalled()
 
     dispose()
   })
@@ -186,36 +253,47 @@ describe('installAnonymousAdmit', () => {
     dispose()
   })
 
-  it('falls back to the stock rejection while the host is disposing', () => {
+  it('rejects new peers while the host is disposing', () => {
     captureConsole()
     const connection = new FakeConnection()
     const dispose = installAnonymousAdmit(connection)
     connection.disposed = true
 
     expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(connection.published).toHaveLength(0)
 
     dispose()
   })
 
-  it('is idempotent across repeated installs and restores the inherited method', () => {
+  it('is idempotent and restores all three inherited gates on final uninstall', () => {
     captureConsole()
     const connection = new FakeConnection()
     const first = installAnonymousAdmit(connection)
     const second = installAnonymousAdmit(connection)
-    expect(Object.hasOwn(connection, 'admit')).toBe(true)
 
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
 
     first()
-    // One reference remains: both gates are still patched.
+    // One reference remains: every gate is still patched.
     expect('peer' in connection.admit(request)).toBe(true)
     expect(connection.authorizeIndex!(request, {})).toBe(true)
+    const during = fakeResponse()
+    const publish = vi.fn(() => 'peer-x')
+    connection.authorizeConnect!(connectRequest('/connect'), during, false, publish)
+    expect(publish).toHaveBeenCalledOnce()
 
     second()
     // Fully restored: the prototype methods answer again.
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
+    expect(connection.admit).toBe(FakeConnection.prototype.admit)
+    expect(connection.authorizeIndex).toBe(FakeConnection.prototype.authorizeIndex)
+    expect(connection.authorizeConnect).toBe(FakeConnection.prototype.authorizeConnect)
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(connection.authorizeIndex!(request, {})).toBe(false)
     expect(connection.indexCalls).toHaveLength(1)
   })
@@ -237,23 +315,10 @@ describe('installAnonymousAdmit', () => {
     expect(connection.admit(request)).toEqual({ rejection: 401 })
   })
 
-  it('leaves no own `admit` behind when the original was inherited', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-
-    const dispose = installAnonymousAdmit(connection)
-    expect(Object.hasOwn(connection, 'admit')).toBe(true)
-
-    dispose()
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(connection.admit).toBe(FakeConnection.prototype.admit)
-  })
-
   it('opens the web UI index gate and never consults the stock gate', () => {
     captureConsole()
     const connection = new FakeConnection()
-    const response = { writeHead: vi.fn(), end: vi.fn() }
+    const response = fakeResponse()
 
     const dispose = installAnonymousAdmit(connection)
 
@@ -264,33 +329,132 @@ describe('installAnonymousAdmit', () => {
     dispose()
   })
 
-  it('restores the inherited index gate exactly on final uninstall', () => {
+  it('redirects /connect to the mux with an empty cookie and no launch token', () => {
     captureConsole()
     const connection = new FakeConnection()
-    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    const stockConnect = vi.spyOn(FakeConnection.prototype, 'authorizeConnect')
+    const response = fakeResponse()
+    const publish = vi.fn(() => 'peer-connect')
 
     const dispose = installAnonymousAdmit(connection)
-    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
-    expect(connection.authorizeIndex!(request, {})).toBe(true)
+    connection.authorizeConnect!(connectRequest('/connect?interactions=answer'), response, false, publish)
+
+    expect(stockConnect).not.toHaveBeenCalled()
+    expect(publish).toHaveBeenCalledWith('answer')
+    expect(response.writeHead).toHaveBeenCalledOnce()
+    const [status, headers] = response.writeHead.mock.calls[0]!
+    expect(status).toBe(302)
+    expect(headers).toMatchObject({
+      'cache-control': 'no-store',
+      location: './api/remote.mux',
+      'referrer-policy': 'no-referrer',
+    })
+    const cookie = String(headers?.['set-cookie'])
+    expect(cookie).toContain('dsh-session=;')
+    expect(cookie).toContain('Path=/')
+    expect(cookie).toContain('HttpOnly')
+    expect(cookie).toContain('SameSite=Lax')
+    // The session cookie value is empty: nothing was signed.
+    expect(cookie.slice('dsh-session='.length, cookie.indexOf(';'))).toBe('')
+    expect(response.end).toHaveBeenCalledOnce()
 
     dispose()
-    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
-    expect(connection.authorizeIndex).toBe(FakeConnection.prototype.authorizeIndex)
   })
 
-  it('restores the exact same index gate when it was an own property', () => {
+  it('defaults /connect interactions to none and publishes it', () => {
     captureConsole()
     const connection = new FakeConnection()
-    const originalOwn = (): boolean => false
-    connection.authorizeIndex = originalOwn
+    const response = fakeResponse()
+    const publish = vi.fn(() => 'peer-connect')
 
     const dispose = installAnonymousAdmit(connection)
-    expect(connection.authorizeIndex).not.toBe(originalOwn)
+    connection.authorizeConnect!(connectRequest('/connect'), response, false, publish)
+
+    expect(publish).toHaveBeenCalledWith('none')
+    expect(response.writeHead).toHaveBeenCalledWith(302, expect.any(Object))
+
+    dispose()
+  })
+
+  it('rejects malformed interactions declarations with 400', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const dispose = installAnonymousAdmit(connection)
+
+    for (const url of [
+      '/connect?interactions=bogus',
+      '/connect?interactions=answer&interactions=none',
+    ]) {
+      const response = fakeResponse()
+      const publish = vi.fn(() => 'peer-connect')
+      connection.authorizeConnect!(connectRequest(url), response, false, publish)
+      expect(response.writeHead).toHaveBeenCalledWith(400, expect.any(Object))
+      expect(response.end).toHaveBeenCalledWith(
+        'interactions must be declared once as answer or none\n',
+      )
+      expect(publish).not.toHaveBeenCalled()
+    }
+
+    dispose()
+  })
+
+  it('returns false for non-GET or non-/connect requests and publishes nothing', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const dispose = installAnonymousAdmit(connection)
+
+    for (const [url, method] of [
+      ['/connect', 'POST'],
+      ['/other?interactions=answer', 'GET'],
+    ] as const) {
+      const response = fakeResponse()
+      const publish = vi.fn(() => 'peer-connect')
+      expect(
+        connection.authorizeConnect!(connectRequest(url, method), response, false, publish),
+      ).toBe(false)
+      expect(publish).not.toHaveBeenCalled()
+      expect(response.writeHead).not.toHaveBeenCalled()
+    }
+
+    dispose()
+  })
+
+  it('restores inherited index and connect gates exactly on final uninstall', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
+
+    const dispose = installAnonymousAdmit(connection)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(true)
+    expect(connection.authorizeIndex!(request, {})).toBe(true)
+
+    dispose()
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
+    expect(connection.authorizeIndex).toBe(FakeConnection.prototype.authorizeIndex)
+    expect(connection.authorizeConnect).toBe(FakeConnection.prototype.authorizeConnect)
+  })
+
+  it('restores the exact same gates when they were own properties', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const originalIndex = (): boolean => false
+    const originalConnect = (): void => {}
+    connection.authorizeIndex = originalIndex
+    connection.authorizeConnect = originalConnect
+
+    const dispose = installAnonymousAdmit(connection)
+    expect(connection.authorizeIndex).not.toBe(originalIndex)
+    expect(connection.authorizeConnect).not.toBe(originalConnect)
     expect(connection.authorizeIndex!(request, {})).toBe(true)
 
     dispose()
     expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
-    expect(connection.authorizeIndex).toBe(originalOwn)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(true)
+    expect(connection.authorizeIndex).toBe(originalIndex)
+    expect(connection.authorizeConnect).toBe(originalConnect)
     expect(connection.authorizeIndex!(request, {})).toBe(false)
   })
 
@@ -306,10 +470,9 @@ describe('installAnonymousAdmit', () => {
 
     expect(result.installed).toBe(true)
     expect(result.stage).toBeUndefined()
-    // The `/api` and WebSocket gates still work.
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
-    // The unusable member is left exactly as it was found.
     expect(connection.authorizeIndex).toBeUndefined()
     expect(warnMessages()).toHaveLength(1)
     expect(warnMessages()[0]).toContain(
@@ -321,28 +484,41 @@ describe('installAnonymousAdmit', () => {
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
   })
 
-  it('still installs when the index gate is not a function, with one warning', () => {
+  it('still installs when the connect gate is missing, with one warning', () => {
     captureConsole()
     const connection = new FakeConnection()
-    Object.defineProperty(connection, 'authorizeIndex', {
-      value: {},
+    Object.defineProperty(connection, 'authorizeConnect', {
+      value: undefined,
       configurable: true,
     })
 
     const result = installAnonymousAdmitResult(connection)
 
     expect(result.installed).toBe(true)
-    expect(warnMessages()).toHaveLength(1)
-    expect(warnMessages()[0]).toContain('authorizeIndex is missing')
+    expect(result.stage).toBeUndefined()
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(connection.authorizeConnect).toBeUndefined()
     expect('peer' in connection.admit(request)).toBe(true)
+    expect(connection.authorizeIndex!(request, {})).toBe(true)
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain(
+      'WARNING: connection.authorizeConnect is missing — /connect will still require a launch token',
+    )
+    expect(errorSpy).not.toHaveBeenCalled()
 
     result.dispose()
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
   })
 
-  it('warns once, not per install, when the index gate is missing', () => {
+  it('warns once, not per install, when an optional gate is missing', () => {
     captureConsole()
     const connection = new FakeConnection()
     Object.defineProperty(connection, 'authorizeIndex', {
+      value: undefined,
+      configurable: true,
+    })
+    Object.defineProperty(connection, 'authorizeConnect', {
       value: undefined,
       configurable: true,
     })
@@ -350,32 +526,53 @@ describe('installAnonymousAdmit', () => {
     const first = installAnonymousAdmit(connection)
     const second = installAnonymousAdmit(connection)
 
-    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()).toHaveLength(2)
+    expect(warnMessages().some((m) => m.includes('authorizeIndex is missing'))).toBe(true)
+    expect(warnMessages().some((m) => m.includes('authorizeConnect is missing'))).toBe(true)
 
     first()
     second()
   })
 
-  it('rolls the whole patch back when the index gate cannot be written', () => {
+  it('rolls every gate back when one cannot be written (frozen instance)', () => {
     captureConsole()
     const connection = new FakeConnection()
-    const originalOwn = (): boolean => false
-    connection.authorizeIndex = originalOwn
+    const originalConnect = (): void => {}
+    connection.authorizeConnect = originalConnect
     Object.freeze(connection)
 
     const result = installAnonymousAdmitResult(connection)
 
     expect(result.installed).toBe(false)
     expect(result.stage).toBe('install')
-    // Neither gate is left behind: the instance still has only the own index
-    // gate it had before the attempt.
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
-    expect(connection.authorizeIndex).toBe(originalOwn)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(connection.authorizeConnect).toBe(originalConnect)
     expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
     expectActivationSkipped('install')
     expect(infoSpy).not.toHaveBeenCalled()
     expect(() => result.dispose()).not.toThrow()
+  })
+
+  it('rolls back when only the connect gate is read-only', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const originalConnect = (): void => {}
+    Object.defineProperty(connection, 'authorizeConnect', {
+      value: originalConnect,
+      writable: false,
+      configurable: true,
+    })
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(false)
+    expect(result.stage).toBe('install')
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(connection.authorizeConnect).toBe(originalConnect)
+    expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
+    expectActivationSkipped('install')
   })
 
   it('disposes the anonymous peer on final uninstall', async () => {
@@ -388,6 +585,24 @@ describe('installAnonymousAdmit', () => {
     dispose()
     expect(connection.peers.get(admission.peer.id)).toBeUndefined()
     expect(admission.peer.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not require isTrusted: a missing method still activates', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'isTrusted', {
+      value: undefined,
+      configurable: true,
+    })
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(true)
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect(connection.isTrusted).toBeUndefined()
+    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    expect(errorSpy).not.toHaveBeenCalled()
+    result.dispose()
   })
 
   it('stays inert and logs the stage when publishPeer is unavailable', () => {
@@ -405,21 +620,6 @@ describe('installAnonymousAdmit', () => {
     expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(connection.published).toHaveLength(0)
     expect(() => dispose()).not.toThrow()
-  })
-
-  it('stays inert and logs the stage when isTrusted is unavailable', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    Object.defineProperty(connection, 'isTrusted', {
-      value: undefined,
-      configurable: true,
-    })
-
-    installAnonymousAdmit(connection)
-
-    expectActivationSkipped('connection.isTrusted')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(connection.isTrusted).toBeUndefined()
   })
 
   it('stays inert and logs the stage when peers is not a Map', () => {
@@ -467,6 +667,7 @@ describe('installAnonymousAdmit', () => {
     result.dispose()
 
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
     expect(connection.admit(request)).toEqual({ rejection: 401 })
   })
 
@@ -688,7 +889,7 @@ describe('plugin module', () => {
     expect(publishPeer).not.toHaveBeenCalled()
   })
 
-  it('skips activation when connection.isTrusted is missing', () => {
+  it('activates when connection.isTrusted is missing', () => {
     captureConsole()
     const connection = new FakeConnection()
     Object.defineProperty(connection, 'isTrusted', {
@@ -699,10 +900,13 @@ describe('plugin module', () => {
 
     expect(() => apply(ctx as never)).not.toThrow()
 
-    expectActivationSkipped('connection.isTrusted')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-    expect(connection.published).toHaveLength(0)
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    // The bypass never needed it, but the other gates work with a hostile
+    // Origin and a forged Host because no fence is consulted.
+    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    // One shared peer: the second request reuses the answer peer.
+    expect(connection.published).toHaveLength(1)
   })
 
   it('skips activation when connection.publishPeer is missing', () => {
@@ -774,6 +978,7 @@ describe('plugin module', () => {
     expectActivationSkipped('ctx.effect')
     // The half-installed patch must be rolled back.
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
     expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
     expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(connection.peers.size).toBe(0)
@@ -831,6 +1036,7 @@ describe('plugin module', () => {
     ctx.cleanups[0]!()
     expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
   })
 
   it('never grants anonymous admission on any failed preflight path', () => {
@@ -926,44 +1132,6 @@ describe('runtime wrapper defence', () => {
     return dispose
   }
 
-  it('returns 401 when the original admit throws, and logs once per signature', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    connection.admit = () => {
-      throw new Error('stock admit exploded')
-    }
-    const dispose = installed(connection)
-
-    expect(() => connection.admit(request)).not.toThrow()
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
-
-    const messages = errorMessages()
-    expect(messages).toHaveLength(1)
-    expect(messages[0]).toContain('request path degraded: admit —')
-    expect(messages[0]).toContain('stock admit exploded')
-    expect(messages[0]).toContain('(returning 401)')
-
-    dispose()
-  })
-
-  it('returns 401 when isTrusted throws', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    connection.admit = () => ({ rejection: 401 })
-    connection.isTrusted = () => {
-      throw new Error('trust check exploded')
-    }
-    const dispose = installed(connection)
-
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
-    expect(errorMessages().some((m) => m.includes('request path degraded: isTrusted —'))).toBe(
-      true,
-    )
-
-    dispose()
-  })
-
   it('returns 401 when publishPeer throws', () => {
     captureConsole()
     const connection = new FakeConnection()
@@ -1028,7 +1196,6 @@ describe('runtime wrapper defence', () => {
   it('returns 401 when the disposed flag accessor throws', () => {
     captureConsole()
     const connection = new FakeConnection()
-    connection.admit = () => ({ rejection: 401 })
     Object.defineProperty(connection, 'disposed', {
       get() {
         throw new Error('disposed getter exploded')
@@ -1104,18 +1271,15 @@ describe('runtime wrapper defence', () => {
     dispose()
   })
 
-  it('returns 401 when the original admit returns a malformed result', () => {
+  it('never calls the stock admit even when the request looks authenticated', () => {
     captureConsole()
     const connection = new FakeConnection()
-    connection.admit = () => null as unknown as Admission
+    connection.authenticated = { id: 'browser-peer' }
+    const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installed(connection)
 
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
-    expect(
-      errorMessages().some((m) =>
-        m.includes('request path degraded: admit — unexpected admission result'),
-      ),
-    ).toBe(true)
+    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    expect(stockAdmit).not.toHaveBeenCalled()
 
     dispose()
   })
@@ -1143,8 +1307,8 @@ describe('log sink safety', () => {
     })
 
     const connection = new FakeConnection()
-    connection.admit = () => {
-      throw new Error('stock admit exploded')
+    connection.publishPeer = () => {
+      throw new Error('publish exploded')
     }
     const dispose = installAnonymousAdmit(connection)
 

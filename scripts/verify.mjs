@@ -4,17 +4,19 @@
  *
  * Two profiles are booted on two addresses each — four boots in total:
  *
- *   loopback anon-off  401/401/401 (stock token auth)
- *   loopback anon      200/404/101 (UI + API admitted, info line, no warning)
- *   LAN      anon-off  401/401/401 (stock token auth, no warning)
- *   LAN      anon      200/404/101 (UI + API admitted, WARNING logged)
+ *   loopback anon-off  401/401/403/401/401 (stock token auth)
+ *   loopback anon      200/404/404/302+cookie/101 (UI + API + /connect admitted)
+ *   LAN      anon-off  401/401/403/401/401 (stock token auth, no warning)
+ *   LAN      anon      200/404/404/302+cookie/101 (UI + API + /connect admitted)
  *
  * `anon` has the plugin installed (no config, installing is the switch);
- * `anon-off` is a plain profile without the plugin. Each boot compares three
+ * `anon-off` is a plain profile without the plugin. Each boot compares five
  * unauthenticated entry points:
- *   GET /                -> the web UI shell (connection.authorizeIndex)
- *   GET /api/__probe__   -> the `/api` HTTP admission gate (connection.admit)
- *   GET /api/remote.mux  -> the WebSocket upgrade gate (admitConnection)
+ *   GET /                              -> the web UI shell (connection.authorizeIndex)
+ *   GET /api/__probe__                 -> the `/api` HTTP admission gate (connection.admit)
+ *   GET /api/__probe__ + evil Origin   -> proves the Host/Origin fence is gone
+ *   GET /connect?interactions=answer   -> launch-token exchange (authorizeConnect)
+ *   GET /api/remote.mux                -> the WebSocket upgrade gate (admitConnection)
  *
  * `--host 0.0.0.0` is intentionally never used: dsh itself rejects wildcard
  * binds before the plugin is even loaded.
@@ -161,10 +163,10 @@ function probeIndex(host, port) {
 }
 
 /** Plain no-cookie GET against the `/api` prefix. */
-function probeStatus(host, port) {
+function probeStatus(host, port, headers = {}) {
   return new Promise((resolvePromise) => {
     const req = request(
-      { host, port, path: '/api/__probe__', method: 'GET' },
+      { host, port, path: '/api/__probe__', method: 'GET', headers },
       (res) => {
         res.resume()
         res.once('end', () => resolvePromise(res.statusCode))
@@ -172,6 +174,26 @@ function probeStatus(host, port) {
     )
     req.setTimeout(PROBE_TIMEOUT_MS, () => req.destroy(new Error('probe timeout')))
     req.once('error', () => resolvePromise(undefined))
+    req.end()
+  })
+}
+
+/** Plain no-cookie GET of the `/connect` launch-token exchange. */
+function probeConnect(host, port) {
+  return new Promise((resolvePromise) => {
+    const req = request(
+      { host, port, path: '/connect?interactions=answer', method: 'GET' },
+      (res) => {
+        res.resume()
+        const rawCookie = res.headers['set-cookie']
+        const setCookie = Array.isArray(rawCookie) ? rawCookie[0] : rawCookie
+        res.once('end', () =>
+          resolvePromise({ status: res.statusCode, setCookie: setCookie ?? '' }),
+        )
+      },
+    )
+    req.setTimeout(PROBE_TIMEOUT_MS, () => req.destroy(new Error('connect timeout')))
+    req.once('error', () => resolvePromise({ status: undefined, setCookie: '' }))
     req.end()
   })
 }
@@ -227,14 +249,32 @@ async function runProfile(profile, host, port, accept) {
     // spurious 404. Once the upgrade answers, the `/api` route is present.
     const ws = await waitForUpgrade(profile, host, port, accept)
     const http = await probeStatus(host, port)
+    const evil = await probeStatus(host, port, { Origin: 'http://evil.example.com' })
+    const connect = await probeConnect(host, port)
     const index = await probeIndex(host, port)
+    // The bypass hands back an empty `dsh-session` cookie: present, unsigned.
+    const emptyCookie =
+      connect.setCookie.startsWith('dsh-session=;') &&
+      connect.setCookie.slice('dsh-session='.length, connect.setCookie.indexOf(';')) === ''
 
-    results.push({ profile, host, port, index: index.status, http, ws })
+    results.push({
+      profile,
+      host,
+      port,
+      index: index.status,
+      http,
+      evil,
+      connect: connect.status,
+      cookie: emptyCookie ? 'empty' : connect.setCookie === '' ? 'none' : 'other',
+      ws,
+    })
     log(
       `  status: GET / = ${index.status} (${index.contentType || 'no content-type'}), ` +
-        `GET /api/__probe__ = ${http}, GET /api/remote.mux (upgrade) = ${ws}`,
+        `GET /api/__probe__ = ${http}, GET /api/__probe__ (evil Origin) = ${evil}, ` +
+        `GET /connect = ${connect.status} (cookie: ${connect.setCookie || 'none'}), ` +
+        `GET /api/remote.mux (upgrade) = ${ws}`,
     )
-    return { index, http, ws, output: server.getOutput() }
+    return { index, http, evil, connect: connect.status, emptyCookie, ws, output: server.getOutput() }
   } finally {
     await stop(server)
   }
@@ -269,6 +309,14 @@ try {
     `loopback anon-off: GET /api/__probe__ is 401 (got ${loopbackOff.http})`,
   )
   check(
+    loopbackOff.evil === 403,
+    `loopback anon-off: GET /api/__probe__ with evil Origin is 403 (got ${loopbackOff.evil})`,
+  )
+  check(
+    loopbackOff.connect === 401,
+    `loopback anon-off: GET /connect is 401 (got ${loopbackOff.connect})`,
+  )
+  check(
     loopbackOff.ws === 401,
     `loopback anon-off: GET /api/remote.mux upgrade is 401 (got ${loopbackOff.ws})`,
   )
@@ -292,6 +340,14 @@ try {
   check(
     loopbackOn.http === 404,
     `loopback anon: GET /api/__probe__ is 404 (admitted, got ${loopbackOn.http})`,
+  )
+  check(
+    loopbackOn.evil === 404,
+    `loopback anon: GET /api/__probe__ with evil Origin is 404 (no Host/Origin fence, got ${loopbackOn.evil})`,
+  )
+  check(
+    loopbackOn.connect === 302 && loopbackOn.emptyCookie,
+    `loopback anon: GET /connect is 302 with an empty dsh-session cookie (got ${loopbackOn.connect})`,
   )
   check(
     loopbackOn.ws === 101,
@@ -320,6 +376,14 @@ try {
     `LAN anon-off: GET /api/__probe__ is 401 on ${lanIp} (got ${lanOff.http})`,
   )
   check(
+    lanOff.evil === 403,
+    `LAN anon-off: GET /api/__probe__ with evil Origin is 403 on ${lanIp} (got ${lanOff.evil})`,
+  )
+  check(
+    lanOff.connect === 401,
+    `LAN anon-off: GET /connect is 401 on ${lanIp} (got ${lanOff.connect})`,
+  )
+  check(
     lanOff.ws === 401,
     `LAN anon-off: GET /api/remote.mux upgrade is 401 on ${lanIp} (got ${lanOff.ws})`,
   )
@@ -338,6 +402,14 @@ try {
   check(
     lanOn.http === 404,
     `LAN anon: GET /api/__probe__ is 404 (admitted, got ${lanOn.http})`,
+  )
+  check(
+    lanOn.evil === 404,
+    `LAN anon: GET /api/__probe__ with evil Origin is 404 (no Host/Origin fence, got ${lanOn.evil})`,
+  )
+  check(
+    lanOn.connect === 302 && lanOn.emptyCookie,
+    `LAN anon: GET /connect is 302 with an empty dsh-session cookie (got ${lanOn.connect})`,
   )
   check(
     lanOn.ws === 101,
@@ -360,7 +432,7 @@ try {
 log('\n=== summary ===')
 for (const row of results) {
   log(
-    `  ${row.profile.padEnd(9)} ${row.host.padEnd(15)} :${String(row.port).padEnd(6)} index=${String(row.index).padEnd(4)} probe=${String(row.http).padEnd(4)} upgrade=${row.ws}`,
+    `  ${row.profile.padEnd(9)} ${row.host.padEnd(15)} :${String(row.port).padEnd(6)} index=${String(row.index).padEnd(4)} probe=${String(row.http).padEnd(4)} evil=${String(row.evil).padEnd(4)} connect=${String(row.connect).padEnd(4)} cookie=${row.cookie.padEnd(5)} upgrade=${row.ws}`,
   )
 }
 
@@ -371,5 +443,6 @@ if (failures.length > 0) {
 }
 
 log(
-  '\n[verify] OK: loopback anon-off 401/401/401 vs anon 200/404/101; LAN anon-off 401/401/401 vs anon 200/404/101 with WARNING',
+  '\n[verify] OK: loopback anon-off 401/401/403/401/401 vs anon 200/404/404/302+cookie/101; ' +
+    'LAN anon-off 401/401/403/401/401 vs anon 200/404/404/302+cookie/101 with WARNING',
 )
