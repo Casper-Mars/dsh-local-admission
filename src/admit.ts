@@ -9,11 +9,20 @@
  * `/api` route, the WebSocket upgrade) dispatches through `this.admit(...)`, so
  * an own property on the instance shadows the prototype method.
  *
+ * The web UI shell is gated on a second, independent path:
+ * `dsh-host-frontend-static` calls `ctx.connection.authorizeIndex(req, res)`
+ * before it serves `index.html`, and `BrowserAuth.authorizeIndex` answers `401`
+ * without a `?token=…` query or a session cookie. That method is an own
+ * property of the instance for the same reason as `admit`, so both gates are
+ * overridden together.
+ *
  * Robustness contract: nothing in this module ever throws to the caller. A
  * failed install logs one line and returns a no-op disposer; a failed request
  * logs once per distinct error signature and falls back to `{ rejection: 401 }`.
  * dsh therefore keeps running with its stock token authentication no matter
- * what shape the internal service has.
+ * what shape the internal service has. A missing `authorizeIndex` is not fatal:
+ * the `/api` and WebSocket gates are still patched and only the UI shell keeps
+ * asking for a token.
  */
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 
@@ -47,6 +56,12 @@ export interface PeerRecord {
  */
 export interface PatchableConnection {
   admit(request: ConnectionTrustRequest): Admission
+  /**
+   * Index/UI gate used by `dsh-host-frontend-static`. Optional because a dsh
+   * build without the frontend (or a renamed member) must not block the
+   * `/api` patch.
+   */
+  authorizeIndex?(request: unknown, response: unknown): boolean
   isTrusted(request: ConnectionTrustRequest): boolean
   publishPeer(interactions?: 'answer' | 'none'): string
   peers: Map<string, PeerRecord>
@@ -86,6 +101,12 @@ interface PatchState {
   hadOwn: boolean
   /** The method exactly as found at install time (own function or prototype). */
   originalOwn: AdmitMethod
+  /** Whether the index gate was overridden by this install. */
+  indexPatched: boolean
+  /** Whether `authorizeIndex` was already an own property at install time. */
+  hadOwnIndex: boolean
+  /** The index gate exactly as found at install time, when it was patched. */
+  originalIndexOwn: AuthorizeIndexMethod | undefined
   peerId: string | undefined
   /** Last runtime error signature, used to throttle repeated request logs. */
   lastErrorKey: string | undefined
@@ -96,6 +117,13 @@ type AdmitMethod = (
   this: PatchableConnection,
   request: ConnectionTrustRequest,
 ) => Admission
+
+/** `authorizeIndex` with its receiver typed, kept for exact restoration. */
+type AuthorizeIndexMethod = (
+  this: PatchableConnection,
+  request: unknown,
+  response: unknown,
+) => boolean
 
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
 const STATE = Symbol.for('dsh-bypass-web-token/patch-state')
@@ -111,6 +139,17 @@ export function activationSkipped(stage: string, detail: string): string {
 /** Format the request-degradation line shown once per distinct runtime error. */
 export function requestDegraded(stage: string, detail: string): string {
   return `${LOG_PREFIX} request path degraded: ${stage} — ${detail} (returning 401)`
+}
+
+/**
+ * Format the warning shown when the index gate cannot be overridden.
+ *
+ * Deliberately not an activation failure: the `/api` and WebSocket gates still
+ * work, only the UI shell keeps its token requirement.
+ */
+export function indexGateMissing(detail?: string): string {
+  const suffix = detail === undefined ? '' : ` (${detail})`
+  return `${LOG_PREFIX} WARNING: connection.authorizeIndex is missing — the web UI will still require a token${suffix}`
 }
 
 /** Message extraction that cannot throw on exotic thrown values. */
@@ -377,10 +416,30 @@ export function installAnonymousAdmitResult(
     return failed('connection.admit')
   }
 
+  // The UI shell has its own gate (`dsh-host-frontend-static` asks
+  // `connection.authorizeIndex`). It is patched on a best-effort basis: a dsh
+  // build without it must not lose the `/api` and WebSocket override.
+  let indexMethod: AuthorizeIndexMethod | undefined
+  let indexReadDetail: string | undefined
+  let hadOwnIndex = false
+  try {
+    const candidateIndex = (patched as { authorizeIndex?: unknown }).authorizeIndex
+    if (typeof candidateIndex === 'function') {
+      hadOwnIndex = Object.hasOwn(patched, 'authorizeIndex')
+      indexMethod = candidateIndex as AuthorizeIndexMethod
+    }
+  } catch (error) {
+    indexReadDetail = `could not read connection.authorizeIndex: ${describeError(error)}`
+  }
+  if (indexMethod === undefined) safeWarn(indexGateMissing(indexReadDetail))
+
   const state: PatchState = {
     refs: 1,
     hadOwn,
     originalOwn,
+    indexPatched: indexMethod !== undefined,
+    hadOwnIndex,
+    originalIndexOwn: indexMethod,
     peerId: undefined,
     lastErrorKey: undefined,
   }
@@ -472,6 +531,11 @@ export function installAnonymousAdmitResult(
 
   try {
     patched.admit = admit
+    // The index gate answers `true` for every request: no token, no cookie, no
+    // redirect. It is a plain own property for the same reason as `admit`.
+    if (indexMethod !== undefined) {
+      ;(patched as { authorizeIndex?: unknown }).authorizeIndex = () => true
+    }
     marked[STATE] = state
   } catch (error) {
     // Roll back anything that may have landed before the write failed, so a
@@ -482,6 +546,19 @@ export function installAnonymousAdmitResult(
     } catch {
       // Frozen/sealed instance: nothing was written in the first place.
     }
+    if (indexMethod !== undefined) {
+      try {
+        // `indexMethod` is non-undefined exactly when this install owns the
+        // index gate, so the restoration mirror is safe in both branches.
+        if (hadOwnIndex) {
+          ;(patched as { authorizeIndex?: unknown }).authorizeIndex = indexMethod
+        } else {
+          delete (patched as { authorizeIndex?: unknown }).authorizeIndex
+        }
+      } catch {
+        // Same as above.
+      }
+    }
     try {
       delete marked[STATE]
     } catch {
@@ -490,7 +567,7 @@ export function installAnonymousAdmitResult(
     safeError(
       activationSkipped(
         'install',
-        `cannot patch connection.admit (frozen or read-only instance): ${describeError(error)}`,
+        `cannot patch the connection admission gate (frozen or read-only instance): ${describeError(error)}`,
       ),
     )
     return failed('install')
@@ -525,6 +602,18 @@ function makeDisposer(
         else delete (connection as { admit?: unknown }).admit
       } catch (error) {
         safeError(`${LOG_PREFIX} dispose degraded: connection.admit — ${describeError(error)}`)
+      }
+
+      const originalIndexOwn = state.originalIndexOwn
+      if (state.indexPatched && originalIndexOwn !== undefined) {
+        try {
+          if (state.hadOwnIndex) connection.authorizeIndex = originalIndexOwn
+          else delete (connection as { authorizeIndex?: unknown }).authorizeIndex
+        } catch (error) {
+          safeError(
+            `${LOG_PREFIX} dispose degraded: connection.authorizeIndex — ${describeError(error)}`,
+          )
+        }
       }
 
       const peerId = state.peerId

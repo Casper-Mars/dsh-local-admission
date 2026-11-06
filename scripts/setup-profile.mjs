@@ -8,9 +8,10 @@
  *   anon       plugin installed  (active on whatever address is bound)
  *   anon-off   plugin NOT installed (control group, stock token auth)
  *
- * The plugin is zero-configuration: the patch entry carries no `config` block.
- * Installing the plugin is the switch, so the control group simply does not
- * install it.
+ * The plugin is zero-configuration and ships its own bundle patch, so
+ * `dsh plugin add` is the only step: it registers the package in
+ * `dsh.profile.bundles` and the bundle layer inserts the entry. The control
+ * group simply does not install it.
  *
  * The profile list is deliberately address-agnostic: the plugin has no
  * listener-address admission rule, so the same `anon` profile is booted once on
@@ -18,14 +19,7 @@
  * is rejected by dsh itself, so it is never used here.)
  */
 import { execFileSync } from 'node:child_process'
-import {
-  cpSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir, networkInterfaces } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,13 +30,6 @@ const profilesDir = join(dshHome, 'profiles')
 const template = join(homedir(), '.dsh', 'profiles', 'web')
 const dshBin = process.env.DSH_BIN ?? 'dsh'
 const pnpmBin = process.env.PNPM_BIN ?? 'pnpm'
-
-/** `- insert` appends to the root entry list; the loader validates it. */
-const patchEntry = `- insert:
-    - id: bypass-web-token
-      name: dsh-bypass-web-token
-      inject: ['connection']
-`
 
 /**
  * First non-internal IPv4 address, used by `pnpm verify` for the LAN cases.
@@ -118,10 +105,6 @@ execFileSync(dshBin, ['plugin', '--profile', 'anon', 'add', projectRoot], {
   stdio: 'inherit',
   env: { ...process.env, DSH_HOME: dshHome },
 })
-
-const anonPatch = join(anonDir, 'cordis.patch.yml')
-const originalPatch = readFileSync(anonPatch, 'utf8')
-writeFileSync(anonPatch, `${originalPatch.trimEnd()}\n${patchEntry}`, 'utf8')
 
 console.log('')
 console.log(`[setup] DSH_HOME=${dshHome}`)

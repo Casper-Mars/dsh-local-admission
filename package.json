@@ -1,7 +1,7 @@
 {
   "name": "dsh-bypass-web-token",
   "version": "0.1.0",
-  "description": "Cordis plugin for dsh: admit unauthenticated /api requests as an anonymous owner peer (zero-config, any bind address)",
+  "description": "Cordis plugin for dsh: tokenless UI, /api and WebSocket admission as an anonymous owner peer (zero-config, any bind address)",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,17 +15,28 @@
     "dsh",
     "cordis",
     "plugin",
-    "loopback",
+    "token",
+    "bypass",
     "developer-tools"
   ],
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "engines": {
     "node": ">=20"
   },

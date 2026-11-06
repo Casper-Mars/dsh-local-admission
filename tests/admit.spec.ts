@@ -19,7 +19,15 @@ class FakeConnection implements PatchableConnection {
   trusted = true
   authenticated: PeerLike | undefined
   readonly published: Array<{ id: string; interactions: 'answer' | 'none' | undefined }> = []
+  /** Every call the plugin let through to the stock index gate. */
+  readonly indexCalls: Array<{ request: unknown; response: unknown }> = []
   private seq = 0
+
+  /** Stock `BrowserAuth.authorizeIndex`: refuses without a token or cookie. */
+  authorizeIndex(request: unknown, response: unknown): boolean {
+    this.indexCalls.push({ request, response })
+    return false
+  }
 
   admit(_request: ConnectionTrustRequest): Admission {
     if (!this.isTrusted()) return { rejection: 403 }
@@ -107,6 +115,8 @@ function expectActivationSkipped(stage: string): void {
 /** Shared success assertions: patch landed, one disposer, exactly one info line. */
 function expectActivated(ctx: FakeContext, connection: FakeConnection): void {
   expect(Object.hasOwn(connection, 'admit')).toBe(true)
+  expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+  expect(connection.authorizeIndex!(request, {})).toBe(true)
   expect('peer' in connection.admit(request)).toBe(true)
   expect(ctx.cleanups).toHaveLength(1)
   expect(infoSpy).toHaveBeenCalledOnce()
@@ -197,13 +207,17 @@ describe('installAnonymousAdmit', () => {
     expect('peer' in connection.admit(request)).toBe(true)
 
     first()
-    // One reference remains: the patch is still installed.
+    // One reference remains: both gates are still patched.
     expect('peer' in connection.admit(request)).toBe(true)
+    expect(connection.authorizeIndex!(request, {})).toBe(true)
 
     second()
-    // Fully restored: the prototype method answers 401 again.
+    // Fully restored: the prototype methods answer again.
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
     expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(connection.authorizeIndex!(request, {})).toBe(false)
+    expect(connection.indexCalls).toHaveLength(1)
   })
 
   it('restores the exact same function when `admit` was an own property', () => {
@@ -234,6 +248,134 @@ describe('installAnonymousAdmit', () => {
     dispose()
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
     expect(connection.admit).toBe(FakeConnection.prototype.admit)
+  })
+
+  it('opens the web UI index gate and never consults the stock gate', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const response = { writeHead: vi.fn(), end: vi.fn() }
+
+    const dispose = installAnonymousAdmit(connection)
+
+    expect(connection.authorizeIndex!(request, response)).toBe(true)
+    expect(connection.indexCalls).toHaveLength(0)
+    expect(response.writeHead).not.toHaveBeenCalled()
+
+    dispose()
+  })
+
+  it('restores the inherited index gate exactly on final uninstall', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+
+    const dispose = installAnonymousAdmit(connection)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(connection.authorizeIndex!(request, {})).toBe(true)
+
+    dispose()
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(false)
+    expect(connection.authorizeIndex).toBe(FakeConnection.prototype.authorizeIndex)
+  })
+
+  it('restores the exact same index gate when it was an own property', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const originalOwn = (): boolean => false
+    connection.authorizeIndex = originalOwn
+
+    const dispose = installAnonymousAdmit(connection)
+    expect(connection.authorizeIndex).not.toBe(originalOwn)
+    expect(connection.authorizeIndex!(request, {})).toBe(true)
+
+    dispose()
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(connection.authorizeIndex).toBe(originalOwn)
+    expect(connection.authorizeIndex!(request, {})).toBe(false)
+  })
+
+  it('still installs when the index gate is missing, with one warning', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'authorizeIndex', {
+      value: undefined,
+      configurable: true,
+    })
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(true)
+    expect(result.stage).toBeUndefined()
+    // The `/api` and WebSocket gates still work.
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect('peer' in connection.admit(request)).toBe(true)
+    // The unusable member is left exactly as it was found.
+    expect(connection.authorizeIndex).toBeUndefined()
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain(
+      'WARNING: connection.authorizeIndex is missing — the web UI will still require a token',
+    )
+    expect(errorSpy).not.toHaveBeenCalled()
+
+    result.dispose()
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+  })
+
+  it('still installs when the index gate is not a function, with one warning', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'authorizeIndex', {
+      value: {},
+      configurable: true,
+    })
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(true)
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain('authorizeIndex is missing')
+    expect('peer' in connection.admit(request)).toBe(true)
+
+    result.dispose()
+  })
+
+  it('warns once, not per install, when the index gate is missing', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'authorizeIndex', {
+      value: undefined,
+      configurable: true,
+    })
+
+    const first = installAnonymousAdmit(connection)
+    const second = installAnonymousAdmit(connection)
+
+    expect(warnMessages()).toHaveLength(1)
+
+    first()
+    second()
+  })
+
+  it('rolls the whole patch back when the index gate cannot be written', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const originalOwn = (): boolean => false
+    connection.authorizeIndex = originalOwn
+    Object.freeze(connection)
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(false)
+    expect(result.stage).toBe('install')
+    // Neither gate is left behind: the instance still has only the own index
+    // gate it had before the attempt.
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(Object.hasOwn(connection, 'authorizeIndex')).toBe(true)
+    expect(connection.authorizeIndex).toBe(originalOwn)
+    expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
+    expectActivationSkipped('install')
+    expect(infoSpy).not.toHaveBeenCalled()
+    expect(() => result.dispose()).not.toThrow()
   })
 
   it('disposes the anonymous peer on final uninstall', async () => {

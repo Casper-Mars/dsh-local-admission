@@ -4,15 +4,16 @@
  *
  * Two profiles are booted on two addresses each — four boots in total:
  *
- *   loopback anon-off  401/401 (stock token auth)
- *   loopback anon      404/101 (admitted, info line, no warning)
- *   LAN      anon-off  401/401 (stock token auth, no warning)
- *   LAN      anon      404/101 (admitted, WARNING logged)
+ *   loopback anon-off  401/401/401 (stock token auth)
+ *   loopback anon      200/404/101 (UI + API admitted, info line, no warning)
+ *   LAN      anon-off  401/401/401 (stock token auth, no warning)
+ *   LAN      anon      200/404/101 (UI + API admitted, WARNING logged)
  *
  * `anon` has the plugin installed (no config, installing is the switch);
- * `anon-off` is a plain profile without the plugin. Each boot compares two
- * unauthenticated transports:
- *   GET /api/__probe__   -> the `/api` HTTP admission gate
+ * `anon-off` is a plain profile without the plugin. Each boot compares three
+ * unauthenticated entry points:
+ *   GET /                -> the web UI shell (connection.authorizeIndex)
+ *   GET /api/__probe__   -> the `/api` HTTP admission gate (connection.admit)
  *   GET /api/remote.mux  -> the WebSocket upgrade gate (admitConnection)
  *
  * `--host 0.0.0.0` is intentionally never used: dsh itself rejects wildcard
@@ -131,6 +132,34 @@ async function stop(server) {
   clearTimeout(forced)
 }
 
+/** Plain no-cookie GET of the web UI shell; returns status, type and body. */
+function probeIndex(host, port) {
+  return new Promise((resolvePromise) => {
+    const req = request(
+      { host, port, path: '/', method: 'GET', headers: { accept: 'text/html' } },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          if (body.length < 4096) body += chunk
+        })
+        res.once('end', () =>
+          resolvePromise({
+            status: res.statusCode,
+            contentType: String(res.headers['content-type'] ?? ''),
+            body,
+          }),
+        )
+      },
+    )
+    req.setTimeout(PROBE_TIMEOUT_MS, () => req.destroy(new Error('index timeout')))
+    req.once('error', () =>
+      resolvePromise({ status: undefined, contentType: '', body: '' }),
+    )
+    req.end()
+  })
+}
+
 /** Plain no-cookie GET against the `/api` prefix. */
 function probeStatus(host, port) {
   return new Promise((resolvePromise) => {
@@ -198,10 +227,14 @@ async function runProfile(profile, host, port, accept) {
     // spurious 404. Once the upgrade answers, the `/api` route is present.
     const ws = await waitForUpgrade(profile, host, port, accept)
     const http = await probeStatus(host, port)
+    const index = await probeIndex(host, port)
 
-    results.push({ profile, host, port, http, ws })
-    log(`  status: GET /api/__probe__ = ${http}, GET /api/remote.mux (upgrade) = ${ws}`)
-    return { http, ws, output: server.getOutput() }
+    results.push({ profile, host, port, index: index.status, http, ws })
+    log(
+      `  status: GET / = ${index.status} (${index.contentType || 'no content-type'}), ` +
+        `GET /api/__probe__ = ${http}, GET /api/remote.mux (upgrade) = ${ws}`,
+    )
+    return { index, http, ws, output: server.getOutput() }
   } finally {
     await stop(server)
   }
@@ -227,6 +260,11 @@ try {
     (status) => status === 401,
   )
   check(
+    loopbackOff.index.status === 401 &&
+      loopbackOff.index.body.includes('dsh web authentication required'),
+    `loopback anon-off: GET / is 401 with the token notice (got ${loopbackOff.index.status})`,
+  )
+  check(
     loopbackOff.http === 401,
     `loopback anon-off: GET /api/__probe__ is 401 (got ${loopbackOff.http})`,
   )
@@ -244,6 +282,12 @@ try {
     LOOPBACK,
     LOOPBACK_PORT,
     (status) => status === 101,
+  )
+  check(
+    loopbackOn.index.status === 200 &&
+      loopbackOn.index.contentType.includes('text/html') &&
+      /<html[\s>]/i.test(loopbackOn.index.body),
+    `loopback anon: GET / is 200 HTML (got ${loopbackOn.index.status}, ${loopbackOn.index.contentType})`,
   )
   check(
     loopbackOn.http === 404,
@@ -267,6 +311,11 @@ try {
   // --- LAN ----------------------------------------------------------------
   const lanOff = await runProfile('anon-off', lanIp, LAN_PORT, (status) => status === 401)
   check(
+    lanOff.index.status === 401 &&
+      lanOff.index.body.includes('dsh web authentication required'),
+    `LAN anon-off: GET / is 401 with the token notice on ${lanIp} (got ${lanOff.index.status})`,
+  )
+  check(
     lanOff.http === 401,
     `LAN anon-off: GET /api/__probe__ is 401 on ${lanIp} (got ${lanOff.http})`,
   )
@@ -280,6 +329,12 @@ try {
   )
 
   const lanOn = await runProfile('anon', lanIp, LAN_PORT, (status) => status === 101)
+  check(
+    lanOn.index.status === 200 &&
+      lanOn.index.contentType.includes('text/html') &&
+      /<html[\s>]/i.test(lanOn.index.body),
+    `LAN anon: GET / is 200 HTML on ${lanIp} (got ${lanOn.index.status}, ${lanOn.index.contentType})`,
+  )
   check(
     lanOn.http === 404,
     `LAN anon: GET /api/__probe__ is 404 (admitted, got ${lanOn.http})`,
@@ -305,7 +360,7 @@ try {
 log('\n=== summary ===')
 for (const row of results) {
   log(
-    `  ${row.profile.padEnd(9)} ${row.host.padEnd(15)} :${String(row.port).padEnd(6)} probe=${String(row.http).padEnd(4)} upgrade=${row.ws}`,
+    `  ${row.profile.padEnd(9)} ${row.host.padEnd(15)} :${String(row.port).padEnd(6)} index=${String(row.index).padEnd(4)} probe=${String(row.http).padEnd(4)} upgrade=${row.ws}`,
   )
 }
 
@@ -316,5 +371,5 @@ if (failures.length > 0) {
 }
 
 log(
-  '\n[verify] OK: loopback anon-off 401/401 vs anon 404/101; LAN anon-off 401/401 vs anon 404/101 with WARNING',
+  '\n[verify] OK: loopback anon-off 401/401/401 vs anon 200/404/101; LAN anon-off 401/401/401 vs anon 200/404/101 with WARNING',
 )

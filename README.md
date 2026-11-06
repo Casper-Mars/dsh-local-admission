@@ -5,9 +5,9 @@
 [![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.2-blue.svg)](https://www.npmjs.com/package/@deepseek-ai/dsh)
 
-> A zero-configuration Cordis plugin that admits unauthenticated `/api` traffic to a `dsh` instance as an anonymous owner peer — install it and it is on, remove it and dsh is stock again. No options, no listener-address admission rule, no forked packages, and no weakening of the Host/Origin fence.
+> A zero-configuration Cordis plugin that drops the token gate from a `dsh` instance — UI, `/api`, and WebSocket — admitting unauthenticated traffic as an anonymous owner peer. Install it and it is on; remove it and dsh is stock again. No options, no listener-address rule, no forked packages, and the Host/Origin fence stays intact.
 
-`dsh web` normally prints `http://127.0.0.1:<port>/?token=…`, and every client — a browser you drive by hand, a headless automation script, a health probe — has to carry that token. This plugin replaces the admission gate on the live `connection` service instance so that requests to the `/api` surface are let through as a single shared owner peer. Everything is scoped to the running process: no package is modified, no class is monkey-patched globally, and disposal restores the stock behaviour exactly.
+`dsh web` normally prints `http://127.0.0.1:<port>/?token=…`, and every client — a browser you drive by hand, a headless automation script, a health probe — has to carry that token. This plugin replaces both gates on the live `connection` service instance — `admit` for `/api` and WebSocket, `authorizeIndex` for the UI shell — so anything that reaches the port is let through as a single shared owner peer. Everything is scoped to the running process: no package is modified, no class is monkey-patched globally, and disposal restores the stock behaviour exactly.
 
 > [!WARNING]
 > The anonymous peer has the `owner` principal. There is **no listener-address restriction**: whatever address the web server binds, anything that can reach that port — every local process, every browser tab on the machine, and every host on the LAN when you bind a LAN address — gains full read/write access to every session and RPC. Use it on a **trusted, single-user machine or a disposable test environment only**, and never map the port to the public internet.
@@ -35,11 +35,13 @@ Both transports are covered because the `/api` HTTP router and the WebSocket upg
 
 ### What is actually admitted
 
-Admission is limited to traffic that reaches `connection.admit`: the `/api/*` HTTP routes and the `/api/remote.mux` WebSocket upgrade. That is the surface automation clients use.
+The plugin overrides **both** gates: `connection.admit` (the `/api/*` HTTP routes and the `/api/remote.mux` WebSocket upgrade) and `connection.authorizeIndex` (the web UI shell, which normally demands a `?token=` query or a signed browser cookie).
 
 - `GET /api/<anything>` without a token → admitted (`404` when the route does not exist, i.e. the request was no longer rejected by the token gate).
 - `GET /api/remote.mux` upgrade without a token → `101`.
-- `GET /`, `GET /index.html`, and the rest of the static web UI without a token → **still 401**. The page shell has its own gate, which this plugin does not touch. A browser UI session still needs the printed `?token=…` URL; the plugin does not make the UI tokenless.
+- `GET /` without a token or cookie → **200**, the UI loads and its API calls go through the same override. No cookie is minted, validated, or required.
+
+The cookie path is bypassed rather than forged: `authorizeIndex` is replaced with `() => true`, so `BrowserAuth.authenticate` is never consulted for the index route.
 
 ## How it works
 
@@ -65,7 +67,8 @@ flowchart LR
 4. **One shared `interactions: 'answer'` peer.** `publishPeer('answer')` registers the peer in the service's `peers` map. `admitConnection` looks peers up by id to take socket ownership, so an `answer` peer is required; a browser peer would be rejected by `gateway/interactions-forbidden`.
 5. **Peer lifecycle mirrors the socket.** When a WebSocket closes, dsh deletes the peer record. The wrapper notices the missing record on the next request and publishes a fresh peer instead of reusing a dead id — otherwise the second upgrade would fall back to `401`.
 6. **Reversible and idempotent.** The exact original function reference is kept (no `bind` copy). Disposal writes it back, or deletes the own property when the method was inherited. Repeated installs share one patch through a `Symbol.for(...)` marker plus a reference count, so HMR reloads and duplicate `apply` calls cannot wrap the wrapper.
-7. **The bind address is only a log detail.** `webServer` is looked up optionally and `webServer.host` is read for wording (loopback → info, otherwise → warning). A missing service, a throwing lookup, or a missing/non-string/throwing `host` cannot block activation; the line then says `unknown`.
+7. **The UI shell is a second gate.** `dsh-host-frontend-static` asks `connection.authorizeIndex` before serving `index.html`, and the stock implementation answers `401` unless it finds a launch token or a signed cookie. The override returns `true` for every request, so no cookie is ever minted or validated for the index route; `authorizeIndex` is restored by the same disposer and refcount as `admit`.
+8. **The bind address is only a log detail.** `webServer` is looked up optionally and `webServer.host` is read for wording (loopback → info, otherwise → warning). A missing service, a throwing lookup, or a missing/non-string/throwing `host` cannot block activation; the line then says `unknown`.
 
 ## Requirements
 
@@ -81,18 +84,9 @@ flowchart LR
 dsh plugin --profile web add dsh-bypass-web-token
 ```
 
-Then make sure the profile's `cordis.patch.yml` contains the plugin entry — there is no `config` block:
+That is the whole installation. The package declares `dsh.bundle`, so `dsh plugin add` registers it in the profile's `dsh.profile.bundles` and the bundle layer inserts the plugin entry — **no `cordis.patch.yml` editing, no config block**. Restart `dsh web` and the UI, `/api/*`, and the WebSocket mux are all reachable without a token.
 
-```yaml
-- insert:
-    - id: bypass-web-token
-      name: dsh-bypass-web-token
-      inject: ['connection']
-```
-
-Restart `dsh web`. The listener keeps printing its usual token URL; requests that arrive without one are now admitted as the anonymous owner peer.
-
-To turn the behaviour off again, remove the entry (or uninstall the plugin) and restart. dsh then behaves exactly as stock.
+To turn the behaviour off again, `dsh plugin --profile web remove dsh-bypass-web-token` and restart. dsh then behaves exactly as stock.
 
 ### From source
 
@@ -103,9 +97,9 @@ pnpm setup     # creates an isolated ./.dsh-home, never touches ~/.dsh
 pnpm verify    # boots dsh four times and asserts the status codes above
 ```
 
-`pnpm setup` copies `~/.dsh/profiles/web` into `./.dsh-home/profiles/anon`, links this repository into that profile, and appends the config-free plugin entry. A second copy of the stock template is created as `anon-off` **without** the plugin, as the control group. `pnpm verify` boots each profile on loopback (`127.0.0.1:18085`) and, with `--host <first non-internal IPv4>`, on the LAN (`:18086`) — four boots in total. It sends token-less requests to `/api/__probe__` and `/api/remote.mux`, records the real status codes, and cleans the processes up with `SIGTERM`.
+`pnpm setup` copies `~/.dsh/profiles/web` into `./.dsh-home/profiles/anon` and installs this repository into that profile with `dsh plugin add` — the same one-command path end users take, which registers the bundle and applies its patch. A second copy of the stock template is created as `anon-off` **without** the plugin, as the control group. `pnpm verify` boots each profile on loopback (`127.0.0.1:18085`) and, with `--host <first non-internal IPv4>`, on the LAN (`:18086`) — four boots in total. It sends token-less requests to `/api/__probe__` and `/api/remote.mux`, records the real status codes, and cleans the processes up with `SIGTERM`.
 
-Automation clients on the LAN can then call `http://192.168.1.92:8081/api/...` without a token, and a WebSocket client can open `ws://192.168.1.92:8081/api/remote.mux` without one. The browser UI at `http://192.168.1.92:8081/` still returns `401` for the page shell — use the printed `?token=…` URL if you also want the UI.
+Automation clients on the LAN can then call `http://192.168.1.92:8081/api/...` without a token, a WebSocket client can open `ws://192.168.1.92:8081/api/remote.mux` without one, and a browser can open `http://192.168.1.92:8081/` directly — the UI loads without a token or cookie.
 
 ## Activation logs
 
@@ -138,6 +132,7 @@ Activation never throws: every failed preflight check logs one line and leaves t
 | `ctx.effect` missing / throws | `ctx.effect` | Plugin inactive, partial patch rolled back |
 | Instance frozen / `admit` read-only | `install` | Rolled back, plugin inactive |
 | `webServer` missing, lookup throws, `host` unreadable | — | **Still active**, log says `unknown` |
+| `connection.authorizeIndex` missing / not a function | — | **Still active**: `/api` and WebSocket are tokenless, the UI shell keeps its token gate |
 
 All skip lines end with `(plugin inactive; dsh keeps stock auth)` and share the prefix `[dsh-bypass-web-token]`. The success line is printed only when the patch really landed (`installed === true`), so a refused install can never produce a contradictory "skip + success" pair.
 
@@ -170,7 +165,7 @@ The plugin depends on four internal members of `HostConnectionService`: `admit`,
 
 ```bash
 pnpm typecheck   # src + tests
-pnpm test        # vitest, 81 tests
+pnpm test        # vitest, 88 tests
 pnpm build       # tsc -> dist
 pnpm setup       # rebuild the isolated profiles (anon / anon-off)
 pnpm verify      # end-to-end status-code assertions
