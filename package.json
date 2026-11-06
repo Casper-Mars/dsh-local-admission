@@ -1,7 +1,7 @@
 {
   "name": "dsh-bypass-web-token",
   "version": "0.1.0",
-  "description": "Cordis plugin for dsh: admit unauthenticated loopback requests as an anonymous owner peer",
+  "description": "Cordis plugin for dsh: admit unauthenticated /api requests as an anonymous owner peer (zero-config, any bind address)",
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -2,29 +2,49 @@
 /**
  * End-to-end proof that the runtime patch works.
  *
- * For both profiles we boot a real dsh web server on the same loopback port and
- * compare two unauthenticated transports:
+ * Two profiles are booted on two addresses each — four boots in total:
+ *
+ *   loopback anon-off  401/401 (stock token auth)
+ *   loopback anon      404/101 (admitted, info line, no warning)
+ *   LAN      anon-off  401/401 (stock token auth, no warning)
+ *   LAN      anon      404/101 (admitted, WARNING logged)
+ *
+ * `anon` has the plugin installed (no config, installing is the switch);
+ * `anon-off` is a plain profile without the plugin. Each boot compares two
+ * unauthenticated transports:
  *   GET /api/__probe__   -> the `/api` HTTP admission gate
  *   GET /api/remote.mux  -> the WebSocket upgrade gate (admitConnection)
  *
- * Expected: `anon-off` rejects with 401 on both, `anon` passes both (404 for the
- * probe means "admitted, no such endpoint"; 101 means the upgrade was accepted).
+ * `--host 0.0.0.0` is intentionally never used: dsh itself rejects wildcard
+ * binds before the plugin is even loaded.
  */
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { request } from 'node:http'
+import { networkInterfaces } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const dshHome = join(projectRoot, '.dsh-home')
 const dshBin = process.env.DSH_BIN ?? 'dsh'
-const PORT = Number(process.env.POC_PORT ?? 18085)
-const HOST = '127.0.0.1'
+const LOOPBACK_PORT = Number(process.env.POC_LOOPBACK_PORT ?? 18085)
+const LAN_PORT = Number(process.env.POC_LAN_PORT ?? 18086)
+const LOOPBACK = '127.0.0.1'
 const START_TIMEOUT_MS = 90_000
 const PROBE_TIMEOUT_MS = 5_000
 const UPGRADE_TIMEOUT_MS = 20_000
+
+/** First non-internal IPv4 address, mirroring `pnpm setup`. */
+function detectLanIpv4() {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === 'IPv4' && !address.internal) return address.address
+    }
+  }
+  return undefined
+}
 
 const failures = []
 const results = []
@@ -47,15 +67,14 @@ function sleep(ms) {
 }
 
 /** Boot one profile and resolve once the server prints its URL. */
-async function boot(profile) {
-  const child = spawn(
-    dshBin,
-    ['--profile', profile, '--no-open', '--port', String(PORT)],
-    {
-      env: { ...process.env, DSH_HOME: dshHome },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  )
+async function boot(profile, host, port) {
+  const args = ['--profile', profile, '--no-open', '--port', String(port)]
+  if (host !== LOOPBACK) args.push('--host', host)
+
+  const child = spawn(dshBin, args, {
+    env: { ...process.env, DSH_HOME: dshHome },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
 
   let output = ''
   let exited
@@ -113,10 +132,10 @@ async function stop(server) {
 }
 
 /** Plain no-cookie GET against the `/api` prefix. */
-function probeStatus() {
+function probeStatus(host, port) {
   return new Promise((resolvePromise) => {
     const req = request(
-      { host: HOST, port: PORT, path: '/api/__probe__', method: 'GET' },
+      { host, port, path: '/api/__probe__', method: 'GET' },
       (res) => {
         res.resume()
         res.once('end', () => resolvePromise(res.statusCode))
@@ -129,11 +148,11 @@ function probeStatus() {
 }
 
 /** One WebSocket upgrade handshake, no cookie; resolves to the HTTP status. */
-function upgradeStatus() {
+function upgradeStatus(host, port) {
   return new Promise((resolvePromise) => {
     const req = request({
-      host: HOST,
-      port: PORT,
+      host,
+      port,
       path: '/api/remote.mux',
       headers: {
         Connection: 'Upgrade',
@@ -157,26 +176,30 @@ function upgradeStatus() {
 }
 
 /** The upgrade route appears only after `appReady`; retry until it answers. */
-async function waitForUpgrade(profile, accept) {
+async function waitForUpgrade(profile, host, port, accept) {
   const deadline = Date.now() + UPGRADE_TIMEOUT_MS
-  let status = await upgradeStatus()
+  let status = await upgradeStatus(host, port)
   while (Date.now() < deadline) {
     if (accept(status)) return status
     await sleep(250)
-    status = await upgradeStatus()
+    status = await upgradeStatus(host, port)
   }
   log(`  (${profile}) last upgrade status: ${status}`)
   return status
 }
 
-async function runProfile(profile, accept) {
-  log(`\n=== ${profile} ===`)
-  const server = await boot(profile)
+async function runProfile(profile, host, port, accept) {
+  log(`\n=== ${profile} (${host}:${port}) ===`)
+  const server = await boot(profile, host, port)
   try {
-    const http = await probeStatus()
-    const ws = await waitForUpgrade(profile, accept)
+    // Wait for the WebSocket gate first: it is mounted later than the `/api`
+    // route, so a successful (or 401) upgrade proves the app finished wiring
+    // routes. Probing HTTP first can otherwise race the mount and yield a
+    // spurious 404. Once the upgrade answers, the `/api` route is present.
+    const ws = await waitForUpgrade(profile, host, port, accept)
+    const http = await probeStatus(host, port)
 
-    results.push({ profile, http, ws })
+    results.push({ profile, host, port, http, ws })
     log(`  status: GET /api/__probe__ = ${http}, GET /api/remote.mux (upgrade) = ${ws}`)
     return { http, ws, output: server.getOutput() }
   } finally {
@@ -189,22 +212,90 @@ if (!existsSync(join(dshHome, 'profiles', 'anon'))) {
   process.exit(1)
 }
 
-let anonOff
-let anon
-try {
-  anonOff = await runProfile('anon-off', (status) => status === 401)
-  check(anonOff.http === 401, `anon-off: GET /api/__probe__ is 401 (got ${anonOff.http})`)
-  check(anonOff.ws === 401, `anon-off: GET /api/remote.mux upgrade is 401 (got ${anonOff.ws})`)
+const lanIp = detectLanIpv4()
+if (lanIp === undefined) {
+  console.error('[verify] no non-internal IPv4 interface found — cannot run the LAN cases')
+  process.exit(1)
+}
 
-  anon = await runProfile('anon', (status) => status === 101)
-  check(
-    anon.http !== undefined && anon.http !== 401 && anon.http !== 403,
-    `anon: GET /api/__probe__ passed admission (got ${anon.http}, expected 404)`,
+try {
+  // --- loopback -----------------------------------------------------------
+  const loopbackOff = await runProfile(
+    'anon-off',
+    LOOPBACK,
+    LOOPBACK_PORT,
+    (status) => status === 401,
   )
-  check(anon.ws === 101, `anon: GET /api/remote.mux upgrade is 101 (got ${anon.ws})`)
   check(
-    anon.output.includes('[dsh-bypass-web-token]'),
-    'anon: plugin logged its loopback admission notice',
+    loopbackOff.http === 401,
+    `loopback anon-off: GET /api/__probe__ is 401 (got ${loopbackOff.http})`,
+  )
+  check(
+    loopbackOff.ws === 401,
+    `loopback anon-off: GET /api/remote.mux upgrade is 401 (got ${loopbackOff.ws})`,
+  )
+  check(
+    !loopbackOff.output.includes('[dsh-bypass-web-token]'),
+    'loopback anon-off: plugin stayed silent',
+  )
+
+  const loopbackOn = await runProfile(
+    'anon',
+    LOOPBACK,
+    LOOPBACK_PORT,
+    (status) => status === 101,
+  )
+  check(
+    loopbackOn.http === 404,
+    `loopback anon: GET /api/__probe__ is 404 (admitted, got ${loopbackOn.http})`,
+  )
+  check(
+    loopbackOn.ws === 101,
+    `loopback anon: GET /api/remote.mux upgrade is 101 (got ${loopbackOn.ws})`,
+  )
+  check(
+    loopbackOn.output.includes(
+      `[dsh-bypass-web-token] loopback listener ${LOOPBACK}: anonymous requests are admitted as an owner peer`,
+    ),
+    'loopback anon: plugin logged the loopback admission notice',
+  )
+  check(
+    !loopbackOn.output.includes('WARNING:'),
+    'loopback anon: no non-loopback warning was logged',
+  )
+
+  // --- LAN ----------------------------------------------------------------
+  const lanOff = await runProfile('anon-off', lanIp, LAN_PORT, (status) => status === 401)
+  check(
+    lanOff.http === 401,
+    `LAN anon-off: GET /api/__probe__ is 401 on ${lanIp} (got ${lanOff.http})`,
+  )
+  check(
+    lanOff.ws === 401,
+    `LAN anon-off: GET /api/remote.mux upgrade is 401 on ${lanIp} (got ${lanOff.ws})`,
+  )
+  check(
+    !lanOff.output.includes('[dsh-bypass-web-token]'),
+    'LAN anon-off: plugin stayed silent',
+  )
+
+  const lanOn = await runProfile('anon', lanIp, LAN_PORT, (status) => status === 101)
+  check(
+    lanOn.http === 404,
+    `LAN anon: GET /api/__probe__ is 404 (admitted, got ${lanOn.http})`,
+  )
+  check(
+    lanOn.ws === 101,
+    `LAN anon: GET /api/remote.mux upgrade is 101 (got ${lanOn.ws})`,
+  )
+  check(
+    lanOn.output.includes('[dsh-bypass-web-token] WARNING:') &&
+      lanOn.output.includes(`non-loopback listener ${lanIp}`),
+    'LAN anon: plugin warned about non-loopback owner access',
+  )
+  check(
+    !lanOn.output.includes('activation skipped'),
+    'LAN anon: no activation skip was logged',
   )
 } catch (error) {
   console.error(`[verify] ${error.stack ?? error}`)
@@ -213,7 +304,9 @@ try {
 
 log('\n=== summary ===')
 for (const row of results) {
-  log(`  ${row.profile.padEnd(8)} probe=${String(row.http).padEnd(4)} upgrade=${row.ws}`)
+  log(
+    `  ${row.profile.padEnd(9)} ${row.host.padEnd(15)} :${String(row.port).padEnd(6)} probe=${String(row.http).padEnd(4)} upgrade=${row.ws}`,
+  )
 }
 
 if (failures.length > 0) {
@@ -222,4 +315,6 @@ if (failures.length > 0) {
   process.exit(1)
 }
 
-log('\n[verify] OK: anon-off stays 401; anon is admitted on both transports')
+log(
+  '\n[verify] OK: loopback anon-off 401/401 vs anon 404/101; LAN anon-off 401/401 vs anon 404/101 with WARNING',
+)

@@ -74,10 +74,12 @@ const loopback = { host: '127.0.0.1' }
 
 let errorSpy: MockInstance<typeof console.error>
 let infoSpy: MockInstance<typeof console.info>
+let warnSpy: MockInstance<typeof console.warn>
 
 function captureConsole(): void {
   errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
   infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+  warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 }
 
 afterEach(() => {
@@ -88,6 +90,10 @@ function errorMessages(): string[] {
   return errorSpy.mock.calls.map((call) => String(call[0]))
 }
 
+function warnMessages(): string[] {
+  return warnSpy.mock.calls.map((call) => String(call[0]))
+}
+
 function expectActivationSkipped(stage: string): void {
   const messages = errorMessages()
   const hit = messages.filter((message) =>
@@ -96,6 +102,14 @@ function expectActivationSkipped(stage: string): void {
   expect(hit).toHaveLength(1)
   expect(hit[0]).toContain('[dsh-bypass-web-token]')
   expect(hit[0]).toContain('(plugin inactive; dsh keeps stock auth)')
+}
+
+/** Shared success assertions: patch landed, one disposer, exactly one info line. */
+function expectActivated(ctx: FakeContext, connection: FakeConnection): void {
+  expect(Object.hasOwn(connection, 'admit')).toBe(true)
+  expect('peer' in connection.admit(request)).toBe(true)
+  expect(ctx.cleanups).toHaveLength(1)
+  expect(infoSpy).toHaveBeenCalledOnce()
 }
 
 describe('installAnonymousAdmit', () => {
@@ -356,80 +370,43 @@ describe('installAnonymousAdmit', () => {
 })
 
 describe('plugin module', () => {
-  it('exports a Cordis plugin shape', () => {
+  it('exports a zero-config Cordis plugin shape', () => {
     expect(name).toBe('bypass-web-token')
-    expect(inject).toEqual(['connection', 'webServer'])
-    expect((Config as unknown as (value: unknown) => Config)({}).trustLoopback).toBe(
-      false,
-    )
+    expect(inject).toEqual(['connection'])
+    // Cordis requires a schema export, but it must not declare any option.
+    expect(Config({})).toEqual({})
+    expect(Object.keys(Config({}))).toHaveLength(0)
   })
 
-  it('does nothing when trustLoopback is disabled', () => {
+  it('activates unconditionally when called without a config argument', () => {
     captureConsole()
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    apply(ctx as never, { trustLoopback: false })
+    expect(() => apply(ctx as never)).not.toThrow()
 
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expectActivated(ctx, connection)
     expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnSpy).not.toHaveBeenCalled()
+    expect(String(infoSpy.mock.calls[0]![0])).toBe(
+      '[dsh-bypass-web-token] loopback listener 127.0.0.1: anonymous requests are admitted as an owner peer',
+    )
+    expect('peer' in connection.admit(request)).toBe(true)
   })
 
-  it('skips activation when ctx.get(webServer) throws', () => {
+  it('activates unconditionally with an empty config object', () => {
     captureConsole()
     const connection = new FakeConnection()
-    const ctx = new FakeContext({ connection })
-    ctx.getErrorFor = { name: 'webServer', error: new Error('service store not ready') }
+    const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never, {} as never)).not.toThrow()
 
-    expectActivationSkipped("ctx.get('webServer')")
-    expect(errorMessages().join('\n')).toContain('service store not ready')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnSpy).not.toHaveBeenCalled()
   })
 
-  it('skips activation when webServer is unavailable', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    const ctx = new FakeContext({ connection })
-
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
-
-    expectActivationSkipped('webServer')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-  })
-
-  it('skips activation when webServer.host is missing', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    const ctx = new FakeContext({ connection, webServer: {} })
-
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
-
-    expectActivationSkipped('webServer.host')
-    expect(errorMessages().join('\n')).toContain('got undefined')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-  })
-
-  it('skips activation when webServer.host is not a string', () => {
-    captureConsole()
-    const connection = new FakeConnection()
-    const ctx = new FakeContext({ connection, webServer: { host: 8080 } })
-
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
-
-    expectActivationSkipped('webServer.host')
-    expect(errorMessages().join('\n')).toContain('got number (8080)')
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-  })
-
-  it('skips activation on a non-loopback listener and names the host', () => {
+  it('activates on a non-loopback listener with one warning and one info line', () => {
     captureConsole()
     const connection = new FakeConnection()
     const ctx = new FakeContext({
@@ -437,15 +414,76 @@ describe('plugin module', () => {
       webServer: { host: '192.168.1.10' },
     })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
-    expectActivationSkipped('webServer.host')
-    expect(errorMessages().join('\n')).toContain(
-      'trustLoopback requires a loopback listener (got 192.168.1.10)',
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain(
+      'WARNING: anonymous admission is enabled on non-loopback listener 192.168.1.10',
     )
-    expect(Object.hasOwn(connection, 'admit')).toBe(false)
-    expect(ctx.cleanups).toHaveLength(0)
-    expect(connection.published).toHaveLength(0)
+    expect(String(infoSpy.mock.calls[0]![0])).toContain(
+      'non-loopback listener 192.168.1.10',
+    )
+  })
+
+  it('activates when the webServer service is missing', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection })
+
+    expect(() => apply(ctx as never)).not.toThrow()
+
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain('non-loopback listener unknown')
+    expect(String(infoSpy.mock.calls[0]![0])).toContain(
+      'non-loopback listener unknown',
+    )
+  })
+
+  it('activates when ctx.get(webServer) throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection })
+    ctx.getErrorFor = { name: 'webServer', error: new Error('service store not ready') }
+
+    expect(() => apply(ctx as never)).not.toThrow()
+
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain('non-loopback listener unknown')
+  })
+
+  it('activates when webServer.host is missing, non-string, or throws', () => {
+    const variants: unknown[] = [
+      {},
+      { host: 8080 },
+      {
+        get host(): string {
+          throw new Error('host getter exploded')
+        },
+      },
+    ]
+
+    for (const webServer of variants) {
+      captureConsole()
+      const connection = new FakeConnection()
+      const ctx = new FakeContext({ connection, webServer })
+
+      expect(() => apply(ctx as never)).not.toThrow()
+
+      expectActivated(ctx, connection)
+      expect(errorSpy).not.toHaveBeenCalled()
+      expect(warnMessages()).toHaveLength(1)
+      expect(warnMessages()[0]).toContain('non-loopback listener unknown')
+      expect(String(infoSpy.mock.calls[0]![0])).toContain(
+        'non-loopback listener unknown',
+      )
+      vi.restoreAllMocks()
+    }
   })
 
   it('skips activation when ctx.get(connection) throws', () => {
@@ -453,7 +491,7 @@ describe('plugin module', () => {
     const ctx = new FakeContext({ webServer: loopback })
     ctx.getErrorFor = { name: 'connection', error: new Error('connection store exploded') }
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped("ctx.get('connection')")
     // Sanity: the thrown message is surfaced, not swallowed silently.
@@ -465,7 +503,7 @@ describe('plugin module', () => {
     captureConsole()
     const ctx = new FakeContext({ webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection')
     expect(ctx.cleanups).toHaveLength(0)
@@ -481,7 +519,7 @@ describe('plugin module', () => {
     } as unknown as PatchableConnection
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection.admit')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -500,7 +538,7 @@ describe('plugin module', () => {
     } as unknown as PatchableConnection
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection.admit')
     expect(errorMessages().join('\n')).toContain('got [object Object]')
@@ -517,7 +555,7 @@ describe('plugin module', () => {
     })
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection.isTrusted')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -534,7 +572,7 @@ describe('plugin module', () => {
     })
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection.publishPeer')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -551,7 +589,7 @@ describe('plugin module', () => {
     })
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('connection.peers')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -563,7 +601,7 @@ describe('plugin module', () => {
     const connection = new FakeConnection()
     const ctx = { get: (name: string) => ({ connection, webServer: loopback })[name] }
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('ctx.effect')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -575,7 +613,7 @@ describe('plugin module', () => {
     const ctx = new FakeContext({ connection, webServer: loopback })
     ctx.effectThrowsBeforeSetup = true
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('ctx.effect')
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
@@ -589,7 +627,7 @@ describe('plugin module', () => {
     const ctx = new FakeContext({ connection, webServer: loopback })
     ctx.effectThrowsAfterSetup = true
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('ctx.effect')
     // The half-installed patch must be rolled back.
@@ -605,7 +643,7 @@ describe('plugin module', () => {
     Object.freeze(connection)
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
 
     expectActivationSkipped('install')
     // A refused install must stay the only line in the log: no success info.
@@ -623,10 +661,14 @@ describe('plugin module', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    apply(ctx as never, { trustLoopback: true })
+    apply(ctx as never)
 
     expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnSpy).not.toHaveBeenCalled()
     expect(infoSpy).toHaveBeenCalledOnce()
+    expect(String(infoSpy.mock.calls[0]![0])).toBe(
+      '[dsh-bypass-web-token] loopback listener 127.0.0.1: anonymous requests are admitted as an owner peer',
+    )
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
     expect(ctx.cleanups).toHaveLength(1)
@@ -640,7 +682,7 @@ describe('plugin module', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    apply(ctx as never, { trustLoopback: true })
+    apply(ctx as never)
     expect('peer' in connection.admit(request)).toBe(true)
 
     expect(ctx.cleanups).toHaveLength(1)
@@ -650,19 +692,86 @@ describe('plugin module', () => {
   })
 
   it('never grants anonymous admission on any failed preflight path', () => {
-    const cases: Array<{ services: Record<string, unknown>; stage: string }> = [
-      { services: {}, stage: 'webServer' },
-      { services: { webServer: {} }, stage: 'webServer.host' },
-      { services: { webServer: { host: '10.0.0.1' } }, stage: 'webServer.host' },
-      { services: { webServer: loopback }, stage: 'connection' },
+    const cases: Array<{
+      connection: unknown
+      stage: string
+    }> = [
+      {
+        connection: undefined,
+        stage: 'connection',
+      },
+      {
+        connection: {
+          peers: new Map(),
+          isTrusted: () => true,
+          publishPeer: () => 'p',
+        },
+        stage: 'connection.admit',
+      },
     ]
 
     for (const testCase of cases) {
       captureConsole()
-      const ctx = new FakeContext({ ...testCase.services, connection: testCase.services.connection })
-      expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+      const ctx = new FakeContext({
+        connection: testCase.connection,
+        webServer: loopback,
+      })
+      expect(() => apply(ctx as never)).not.toThrow()
       expectActivationSkipped(testCase.stage)
       expect(ctx.cleanups).toHaveLength(0)
+      vi.restoreAllMocks()
+    }
+  })
+})
+
+describe('non-loopback listeners', () => {
+  const lan = { host: '192.168.1.92' }
+
+  it('admits anonymous requests on a LAN listener and warns once', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection, webServer: lan })
+
+    apply(ctx as never)
+
+    expect(errorSpy).not.toHaveBeenCalled()
+    expect(warnMessages()).toHaveLength(1)
+    expect(warnMessages()[0]).toContain(
+      '[dsh-bypass-web-token] WARNING: anonymous admission is enabled on non-loopback listener 192.168.1.92',
+    )
+    expect(warnMessages()[0]).toContain(
+      'every host that can reach this port gets owner access',
+    )
+    expect(infoSpy).toHaveBeenCalledOnce()
+    expect(String(infoSpy.mock.calls[0]![0])).toContain(
+      'non-loopback listener 192.168.1.92: anonymous requests are admitted as an owner peer',
+    )
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect('peer' in connection.admit(request)).toBe(true)
+    expect(ctx.cleanups).toHaveLength(1)
+
+    ctx.cleanups[0]!()
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+  })
+
+  it('does not special-case wildcard binds: the plugin admits them too', () => {
+    // dsh itself refuses `--host 0.0.0.0`, so this cannot happen through the
+    // CLI. The plugin makes no listener-address decision either way; the
+    // warning still names the address.
+    for (const host of ['0.0.0.0', '::']) {
+      captureConsole()
+      const connection = new FakeConnection()
+      const ctx = new FakeContext({ connection, webServer: { host } })
+
+      apply(ctx as never)
+
+      expect(errorMessages()).toHaveLength(0)
+      expect(warnMessages()).toHaveLength(1)
+      expect(warnMessages()[0]).toContain(`non-loopback listener ${host}`)
+      expect(Object.hasOwn(connection, 'admit')).toBe(true)
+      expect('peer' in connection.admit(request)).toBe(true)
+      expect(ctx.cleanups).toHaveLength(1)
       vi.restoreAllMocks()
     }
   })
@@ -881,7 +990,7 @@ describe('log sink safety', () => {
     Object.freeze(connection)
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
     expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
     expect(ctx.cleanups).toHaveLength(0)
   })
@@ -911,9 +1020,25 @@ describe('log sink safety', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: loopback })
 
-    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(() => apply(ctx as never)).not.toThrow()
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
     expect(errorSpy).not.toHaveBeenCalled()
+  })
+
+  it('keeps the patch active when console.warn throws on a non-loopback install', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {
+      throw new Error('log sink exploded')
+    })
+
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection, webServer: { host: '192.168.1.92' } })
+
+    expect(() => apply(ctx as never)).not.toThrow()
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect('peer' in connection.admit(request)).toBe(true)
+    expect(ctx.cleanups).toHaveLength(1)
   })
 })

@@ -1,11 +1,20 @@
 /**
- * `dsh-bypass-web-token` — PoC plugin.
+ * `dsh-bypass-web-token` — zero-configuration PoC plugin.
  *
- * When `trustLoopback` is enabled and the web listener binds a loopback
- * address, unauthenticated requests that pass the Host/Origin fence are
- * admitted as one shared owner Peer with `interactions: 'answer'`. Nothing is
- * forked and no official package is modified: the patch lands on the live
- * `connection` service instance at plugin apply time.
+ * Installing the plugin is the switch: `apply` always tries to override the
+ * live `connection` admission gate. Unauthenticated requests that pass the
+ * Host/Origin fence are admitted as one shared owner Peer with
+ * `interactions: 'answer'`, no matter which address the web listener binds.
+ * Uninstalling the plugin restores the stock behaviour — there is nothing to
+ * configure.
+ *
+ * There is no listener-address admission check: the bind address only selects
+ * the wording of the activation log line, and a non-loopback listener
+ * additionally gets a prominent warning because every host that can reach the
+ * port then gets owner access.
+ *
+ * Nothing is forked and no official package is modified: the patch lands on the
+ * live `connection` service instance at plugin apply time.
  *
  * Robustness contract: `apply` never throws. Every failed preflight check logs
  * one `activation skipped` line explaining which member broke and leaves the
@@ -22,6 +31,7 @@ import {
   probeConnection,
   safeError,
   safeInfo,
+  safeWarn,
 } from './admit.js'
 import { isLoopbackHost } from './guard.js'
 
@@ -41,30 +51,21 @@ export const name = 'bypass-web-token'
 /**
  * Services read by the plugin.
  *
- * Cordis 4.0.5 only supports a flat required-services list (no
- * `required`/`optional` split), so both stay declared here. If `webServer`
- * disappears entirely the fiber simply never activates — dsh is unaffected.
- * A missing member is still handled defensively below for callers that invoke
- * `apply` directly and for partial service implementations.
+ * Only `connection` is required. `webServer` is read optionally for log
+ * wording, so a missing or broken `webServer` service can never keep the
+ * plugin from activating.
  */
-export const inject = ['connection', 'webServer']
+export const inject = ['connection']
 
-/** Plugin configuration. */
-export interface Config {
-  /**
-   * Admit unauthenticated loopback requests as an anonymous owner Peer.
-   * Defaults to `false`, which leaves the stock 401 behaviour untouched.
-   */
-  trustLoopback: boolean
-}
+/**
+ * Cordis requires a config schema export, but this plugin has no options.
+ * The schema is deliberately empty: installing the plugin is the only switch.
+ */
+export const Config = z.object({})
 
-export const Config: z<Config> = z.object({
-  trustLoopback: z.boolean().default(false),
-})
-
-/** The only `webServer` member this plugin reads. */
+/** The only `webServer` member this plugin reads (for log wording only). */
 interface WebServerLike {
-  readonly host?: string
+  readonly host?: unknown
 }
 
 /** Setup callback accepted by `ctx.effect`. */
@@ -77,62 +78,26 @@ type EffectMethod = (setup: EffectSetup, label?: string) => unknown
  * Never throws: any failure is logged with the stage that caused it and the
  * plugin stays inactive, leaving dsh on its stock token authentication.
  *
- * @param ctx - plugin context with `connection` and `webServer` injected.
- * @param config - resolved plugin config (schema defaults applied).
+ * @param ctx - plugin context with `connection` injected.
+ * @param _config - ignored; the plugin has no options.
  */
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, _config?: Record<string, never>): void {
+  void _config
   try {
-    activate(ctx, config)
+    activate(ctx)
   } catch (error) {
     // Last-resort guard: no plugin failure may reach the dsh loader.
     safeError(activationSkipped('unexpected', describeError(error)))
   }
 }
 
-function activate(ctx: Context, config: Config): void {
-  if (config?.trustLoopback !== true) return
-
+function activate(ctx: Context): void {
   const skip = (stage: string, detail: string): void => {
     safeError(activationSkipped(stage, detail))
   }
 
-  // 1. webServer lookup itself can throw on a partially initialized context.
-  let webServer: unknown
-  try {
-    webServer = ctx.get('webServer')
-  } catch (error) {
-    skip("ctx.get('webServer')", describeError(error))
-    return
-  }
-  if (webServer === null || webServer === undefined) {
-    skip('webServer', 'service is unavailable')
-    return
-  }
-
-  // 2. The listener address decides whether anonymous admission is allowed.
-  let host: unknown
-  try {
-    host = (webServer as WebServerLike).host
-  } catch (error) {
-    skip('webServer.host', describeError(error))
-    return
-  }
-  if (typeof host !== 'string' || host === '') {
-    skip(
-      'webServer.host',
-      `expected a non-empty string, got ${typeof host} (${String(host)})`,
-    )
-    return
-  }
-  if (!isLoopbackHost(host)) {
-    skip(
-      'webServer.host',
-      `trustLoopback requires a loopback listener (got ${host})`,
-    )
-    return
-  }
-
-  // 3. connection lookup + structural probe.
+  // 1. connection lookup + structural probe. This is the only gate: if the
+  //    members are present the plugin activates on any listener address.
   let connection: unknown
   try {
     connection = ctx.get('connection')
@@ -151,7 +116,7 @@ function activate(ctx: Context, config: Config): void {
     return
   }
 
-  // 4. `ctx.effect` owns the disposer; refuse to patch without it.
+  // 2. `ctx.effect` owns the disposer; refuse to patch without it.
   const effect = (ctx as unknown as { effect?: unknown }).effect
   if (typeof effect !== 'function') {
     skip('ctx.effect', `expected a function, got ${typeof effect}`)
@@ -190,7 +155,48 @@ function activate(ctx: Context, config: Config): void {
   // followed by a "success" line would be a lie.
   if (!installed) return
 
-  safeInfo(
-    `${LOG_PREFIX} loopback listener ${host}: anonymous requests are admitted as an owner peer`,
+  // The listener address gates nothing: it only selects the log wording.
+  // `webServer` is optional and read defensively; a missing service or a
+  // throwing getter simply means `unknown`, never a skipped activation.
+  const host = readWebHost(ctx)
+  if (host !== undefined && isLoopbackHost(host)) {
+    safeInfo(
+      `${LOG_PREFIX} loopback listener ${host}: anonymous requests are admitted as an owner peer`,
+    )
+    return
+  }
+
+  safeWarn(
+    `${LOG_PREFIX} WARNING: anonymous admission is enabled on non-loopback listener ${host ?? 'unknown'} — every host that can reach this port gets owner access`,
   )
+  safeInfo(
+    `${LOG_PREFIX} non-loopback listener ${host ?? 'unknown'}: anonymous requests are admitted as an owner peer`,
+  )
+}
+
+/**
+ * Read the bind address for log wording only.
+ *
+ * Best-effort by design: a missing `webServer` service, a throwing
+ * `ctx.get('webServer')`, or a missing/non-string/throwing `host` must never
+ * prevent activation, so the caller falls back to `unknown`.
+ *
+ * @param ctx - plugin context.
+ * @returns the bind address, or `undefined` when it cannot be read.
+ */
+function readWebHost(ctx: Context): string | undefined {
+  let webServer: unknown
+  try {
+    webServer = ctx.get('webServer')
+  } catch {
+    return undefined
+  }
+  if (webServer === null || webServer === undefined) return undefined
+
+  try {
+    const host = (webServer as WebServerLike).host
+    return typeof host === 'string' && host !== '' ? host : undefined
+  } catch {
+    return undefined
+  }
 }

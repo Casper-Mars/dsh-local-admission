@@ -148,6 +148,19 @@ export function safeInfo(message: string): void {
 }
 
 /**
+ * Best-effort warning line, used when anonymous admission is active on a
+ * non-loopback listener. Like {@link safeError} and {@link safeInfo}, a broken
+ * log sink must never turn a successful activation into a failure.
+ */
+export function safeWarn(message: string): void {
+  try {
+    console.warn(message)
+  } catch {
+    // Same as above.
+  }
+}
+
+/**
  * Read the peer out of a registry record without trusting the record's shape.
  *
  * Every property read happens here so a hostile getter (`record.peer`,
