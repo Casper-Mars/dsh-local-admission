@@ -8,8 +8,17 @@
  * truth, and every internal caller (`requestRejection`, `admitConnection`, the
  * `/api` route, the WebSocket upgrade) dispatches through `this.admit(...)`, so
  * an own property on the instance shadows the prototype method.
+ *
+ * Robustness contract: nothing in this module ever throws to the caller. A
+ * failed install logs one line and returns a no-op disposer; a failed request
+ * logs once per distinct error signature and falls back to `{ rejection: 401 }`.
+ * dsh therefore keeps running with its stock token authentication no matter
+ * what shape the internal service has.
  */
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
+
+/** Stable log prefix shared with `src/index.ts`. */
+export const LOG_PREFIX = '[dsh-connection-anonymous]'
 
 /**
  * Structural view of a Peer. `@deepseek-ai/dsh-typert-protocol` owns the real
@@ -46,9 +55,30 @@ export interface PatchableConnection {
 
 /** Options for {@link installAnonymousAdmit}. */
 export interface InstallOptions {
-  /** Sink for non-fatal degradations; defaults to `console.warn`. */
+  /**
+   * Kept for API compatibility. Non-fatal diagnostics are written with
+   * `console.error` so every failure is visible in the dsh log.
+   */
   warn?: (message: string) => void
 }
+
+/** A check that failed before anything was patched. */
+export interface ConnectionProbeFailure {
+  readonly ok: false
+  /** Which member/shape was wrong, e.g. `connection.admit`. */
+  readonly stage: string
+  /** Human-readable reason, includes the observed type/value. */
+  readonly detail: string
+}
+
+/** All runtime members needed by the patch are present and callable. */
+export interface ConnectionProbeSuccess {
+  readonly ok: true
+  readonly connection: PatchableConnection
+}
+
+/** Result of the non-throwing preflight probe. */
+export type ConnectionProbe = ConnectionProbeFailure | ConnectionProbeSuccess
 
 interface PatchState {
   refs: number
@@ -57,6 +87,8 @@ interface PatchState {
   /** The method exactly as found at install time (own function or prototype). */
   originalOwn: AdmitMethod
   peerId: string | undefined
+  /** Last runtime error signature, used to throttle repeated request logs. */
+  lastErrorKey: string | undefined
 }
 
 /** `admit` with its receiver typed, so the wrapper can `call` the original. */
@@ -68,22 +100,117 @@ type AdmitMethod = (
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
 const STATE = Symbol.for('dsh-connection-anonymous/patch-state')
 
+/** Disposer returned when nothing was installed. */
+const noop = (): void => {}
+
+/** Format the activation-skip line shown once per failed preflight. */
+export function activationSkipped(stage: string, detail: string): string {
+  return `${LOG_PREFIX} activation skipped: ${stage} — ${detail} (plugin inactive; dsh keeps stock auth)`
+}
+
+/** Format the request-degradation line shown once per distinct runtime error. */
+export function requestDegraded(stage: string, detail: string): string {
+  return `${LOG_PREFIX} request path degraded: ${stage} — ${detail} (returning 401)`
+}
+
+/** Message extraction that cannot throw on exotic thrown values. */
+export function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try {
+    return String(error)
+  } catch {
+    return '<unprintable value>'
+  }
+}
+
+/** Type/value description used in preflight log details. */
+function describeValue(value: unknown): string {
+  if (value === null) return 'null'
+  const type = typeof value
+  if (type === 'string') return JSON.stringify(value)
+  if (type === 'function') return 'a function'
+  if (type === 'object') {
+    try {
+      return Object.prototype.toString.call(value)
+    } catch {
+      return 'an object'
+    }
+  }
+  // undefined / number / boolean / bigint / symbol
+  try {
+    return String(value)
+  } catch {
+    return type
+  }
+}
+
 /**
- * Fail closed unless the runtime still exposes `admit` as a callable method.
+ * Non-throwing preflight for the runtime members the patch depends on.
  *
- * The published type says `admit` exists, but a dsh upgrade can remove or
- * rename this internal symbol. Detecting that at activation time keeps the
- * failure visible to the loader instead of deferring a `TypeError` to the
- * first request.
+ * The published type promises all of these, but a dsh upgrade can rename or
+ * hide an internal symbol. Returning a structured result (instead of throwing)
+ * lets `apply` log exactly which member broke and stay inert.
+ *
+ * @param connection - value returned by `ctx.get('connection')`.
+ * @returns `{ ok: true, connection }` or `{ ok: false, stage, detail }`.
  */
-export function assertAdmitMethod(
-  connection: PatchableConnection,
-): asserts connection is PatchableConnection {
-  if (typeof (connection as { admit?: unknown }).admit === 'function') return
-  const message =
-    '[dsh-connection-anonymous] refusing to activate: connection.admit is missing or not a function'
-  console.error(message)
-  throw new Error(message)
+export function probeConnection(connection: unknown): ConnectionProbe {
+  try {
+    return inspectConnection(connection)
+  } catch (error) {
+    // A Proxy/getter on the service object may throw while being inspected.
+    return {
+      ok: false,
+      stage: 'connection',
+      detail: `could not inspect the connection service: ${describeError(error)}`,
+    }
+  }
+}
+
+function inspectConnection(connection: unknown): ConnectionProbe {
+  if (connection === null || typeof connection !== 'object') {
+    return {
+      ok: false,
+      stage: 'connection',
+      detail: `expected the connection service object, got ${describeValue(connection)}`,
+    }
+  }
+
+  const candidate = connection as Partial<PatchableConnection> & Record<PropertyKey, unknown>
+
+  if (typeof candidate.admit !== 'function') {
+    return {
+      ok: false,
+      stage: 'connection.admit',
+      detail: `expected a function, got ${describeValue(candidate.admit)}`,
+    }
+  }
+
+  if (typeof candidate.isTrusted !== 'function') {
+    return {
+      ok: false,
+      stage: 'connection.isTrusted',
+      detail: `expected a function, got ${describeValue(candidate.isTrusted)}`,
+    }
+  }
+
+  if (typeof candidate.publishPeer !== 'function') {
+    return {
+      ok: false,
+      stage: 'connection.publishPeer',
+      detail: `expected a function, got ${describeValue(candidate.publishPeer)}`,
+    }
+  }
+
+  if (!(candidate.peers instanceof Map)) {
+    return {
+      ok: false,
+      stage: 'connection.peers',
+      detail: `expected a Map, got ${describeValue(candidate.peers)}`,
+    }
+  }
+
+  return { ok: true, connection: connection as PatchableConnection }
 }
 
 /**
@@ -91,75 +218,189 @@ export function assertAdmitMethod(
  * instance. Repeated installs only bump a reference count, so an HMR reload or
  * a second apply cannot wrap the wrapper.
  *
+ * This function never throws. When the preflight fails or the property cannot
+ * be written (frozen/read-only instance), it logs one `activation skipped`
+ * line and returns a no-op disposer, leaving the stock admission intact.
+ *
  * @param connection - live `ctx.get('connection')` service instance.
- * @param options - optional diagnostics sink.
+ * @param options - optional diagnostics sink (retained for compatibility).
  * @returns idempotent disposer restoring the original admission behaviour.
  */
 export function installAnonymousAdmit(
   connection: PatchableConnection,
   options: InstallOptions = {},
 ): () => void {
-  assertAdmitMethod(connection)
+  void options
 
-  const warn = options.warn ?? ((message: string) => console.warn(message))
-  const marked = connection as unknown as Record<PropertyKey, unknown>
+  const probe = probeConnection(connection)
+  if (!probe.ok) {
+    console.error(activationSkipped(probe.stage, probe.detail))
+    return noop
+  }
+  const patched = probe.connection
 
-  const existing = marked[STATE] as PatchState | undefined
+  const marked = patched as unknown as Record<PropertyKey, unknown>
+
+  let existing: PatchState | undefined
+  try {
+    existing = marked[STATE] as PatchState | undefined
+  } catch {
+    existing = undefined
+  }
   if (existing !== undefined) {
     existing.refs += 1
-    return makeDisposer(connection, existing)
+    return makeDisposer(patched, existing)
   }
 
-  const hadOwn = Object.hasOwn(connection, 'admit')
-  // Keep the exact function that was there. `bind` would produce a copy, and
-  // writing that copy back on uninstall would break identity with the original
-  // own property; calling with `connection` covers inherited methods too.
-  const originalOwn = connection.admit as AdmitMethod
-  const canPublish =
-    typeof connection.publishPeer === 'function' && connection.peers instanceof Map
-  if (!canPublish) {
-    warn(
-      '[dsh-connection-anonymous] connection.publishPeer/peers are missing; anonymous admission stays disabled',
+  let hadOwn: boolean
+  let originalOwn: AdmitMethod
+  try {
+    hadOwn = Object.hasOwn(patched, 'admit')
+    // Keep the exact function that was there. `bind` would produce a copy, and
+    // writing that copy back on uninstall would break identity with the
+    // original own property; calling with `patched` covers inherited methods.
+    originalOwn = patched.admit as AdmitMethod
+  } catch (error) {
+    console.error(
+      activationSkipped(
+        'connection.admit',
+        `could not read connection.admit: ${describeError(error)}`,
+      ),
     )
+    return noop
   }
 
-  const state: PatchState = { refs: 1, hadOwn, originalOwn, peerId: undefined }
+  const state: PatchState = {
+    refs: 1,
+    hadOwn,
+    originalOwn,
+    peerId: undefined,
+    lastErrorKey: undefined,
+  }
+
+  /** Log/return once per distinct runtime failure; never throws. */
+  const degrade = (stage: string, error: unknown): Admission => {
+    const detail = describeError(error)
+    const key = `${stage}:${detail}`
+    if (state.lastErrorKey !== key) {
+      state.lastErrorKey = key
+      console.error(requestDegraded(stage, detail))
+    }
+    return { rejection: 401 }
+  }
 
   const admit = (request: ConnectionTrustRequest): Admission => {
-    const admission = originalOwn.call(connection, request)
-    // 1. Missing internals: keep the stock 401 rather than widening the fence.
-    if (!canPublish) return admission
-    // 2. A real browser/API credential always wins; never downgrade it.
+    // 1. The stock gate runs first: a real browser/API credential always wins.
+    let admission: Admission
+    try {
+      admission = originalOwn.call(patched, request)
+    } catch (error) {
+      return degrade('admit', error)
+    }
+    if (admission === null || typeof admission !== 'object') {
+      return degrade(
+        'admit',
+        new TypeError(`unexpected admission result: ${describeValue(admission)}`),
+      )
+    }
     if ('peer' in admission) return admission
-    // 3. A disposing host must not mint new Peers.
-    if (connection.disposed === true) return admission
-    // 4. The Host/Origin fence is not optional.
-    if (!connection.isTrusted(request)) return { rejection: 403 }
 
-    // 5. `admitConnection` looks the peer up by id and deletes it on socket
+    // 2. A disposing host must not mint new Peers.
+    let disposed: boolean
+    try {
+      disposed = patched.disposed === true
+    } catch (error) {
+      return degrade('disposed', error)
+    }
+    if (disposed) return admission
+
+    // 3. The Host/Origin fence is not optional.
+    let trusted: boolean
+    try {
+      trusted = patched.isTrusted.call(patched, request)
+    } catch (error) {
+      return degrade('isTrusted', error)
+    }
+    if (!trusted) return { rejection: 403 }
+
+    // 4. `admitConnection` looks the peer up by id and deletes it on socket
     //    close, so a released peer must be republished instead of reused.
-    let record =
-      state.peerId === undefined ? undefined : connection.peers.get(state.peerId)
+    let record: PeerRecord | undefined
+    try {
+      record = state.peerId === undefined ? undefined : patched.peers.get(state.peerId)
+    } catch (error) {
+      return degrade('peers.get', error)
+    }
+
     if (record === undefined) {
-      state.peerId = connection.publishPeer('answer')
-      record = connection.peers.get(state.peerId)
-      if (record === undefined) {
-        warn(
-          '[dsh-connection-anonymous] published peer disappeared; keeping the original rejection',
+      let peerId: string
+      try {
+        peerId = patched.publishPeer.call(patched, 'answer')
+      } catch (error) {
+        return degrade('publishPeer', error)
+      }
+      if (typeof peerId !== 'string' || peerId === '') {
+        return degrade(
+          'publishPeer',
+          new TypeError(`publishPeer returned ${describeValue(peerId)} instead of an id`),
         )
-        return admission
+      }
+      state.peerId = peerId
+      try {
+        record = patched.peers.get(peerId)
+      } catch (error) {
+        return degrade('peers.get', error)
       }
     }
-    return { peer: record.peer }
+
+    if (record === undefined || typeof record !== 'object') {
+      return degrade(
+        'peer record',
+        new TypeError(`published peer record is ${describeValue(record)}`),
+      )
+    }
+
+    const peer = record.peer
+    if (peer === null || typeof peer !== 'object' || typeof peer.id !== 'string') {
+      return degrade(
+        'peer record',
+        new TypeError(`record.peer is ${describeValue(peer)}`),
+      )
+    }
+
+    return { peer }
   }
 
-  connection.admit = admit
-  marked[STATE] = state
+  try {
+    patched.admit = admit
+    marked[STATE] = state
+  } catch (error) {
+    // Roll back anything that may have landed before the write failed, so a
+    // half-installed patch cannot survive.
+    try {
+      if (hadOwn) patched.admit = originalOwn
+      else delete (patched as { admit?: unknown }).admit
+    } catch {
+      // Frozen/sealed instance: nothing was written in the first place.
+    }
+    try {
+      delete marked[STATE]
+    } catch {
+      // Same as above.
+    }
+    console.error(
+      activationSkipped(
+        'install',
+        `cannot patch connection.admit (frozen or read-only instance): ${describeError(error)}`,
+      ),
+    )
+    return noop
+  }
 
-  return makeDisposer(connection, state)
+  return makeDisposer(patched, state)
 }
 
-/** Build one idempotent disposer for a shared patch state. */
+/** Build one idempotent, never-throwing disposer for a shared patch state. */
 function makeDisposer(
   connection: PatchableConnection,
   state: PatchState,
@@ -168,23 +409,63 @@ function makeDisposer(
   return () => {
     if (called) return
     called = true
-    state.refs -= 1
-    if (state.refs > 0) return
 
-    const marked = connection as unknown as Record<PropertyKey, unknown>
-    delete marked[STATE]
+    try {
+      state.refs -= 1
+      if (state.refs > 0) return
 
-    if (state.hadOwn) connection.admit = state.originalOwn
-    else delete (connection as { admit?: unknown }).admit
+      const marked = connection as unknown as Record<PropertyKey, unknown>
+      try {
+        delete marked[STATE]
+      } catch (error) {
+        console.error(`${LOG_PREFIX} dispose degraded: state marker — ${describeError(error)}`)
+      }
 
-    const record =
-      state.peerId === undefined ? undefined : connection.peers.get(state.peerId)
-    if (record !== undefined && state.peerId !== undefined) {
-      connection.peers.delete(state.peerId)
-      void record.peer.dispose?.().catch(() => {
-        // A peer disposed by host shutdown can reject; nothing left to do.
-      })
+      try {
+        if (state.hadOwn) connection.admit = state.originalOwn
+        else delete (connection as { admit?: unknown }).admit
+      } catch (error) {
+        console.error(`${LOG_PREFIX} dispose degraded: connection.admit — ${describeError(error)}`)
+      }
+
+      const peerId = state.peerId
+      state.peerId = undefined
+      if (peerId === undefined) return
+
+      let record: PeerRecord | undefined
+      try {
+        record = connection.peers.get(peerId)
+      } catch {
+        return
+      }
+      if (record === undefined) return
+
+      try {
+        connection.peers.delete(peerId)
+      } catch {
+        // A closed registry needs no cleanup.
+      }
+
+      try {
+        const peer = record.peer
+        const disposePeer = peer?.dispose
+        if (typeof disposePeer === 'function') {
+          const result = disposePeer.call(peer)
+          // Both a synchronous throw (caught above) and an async rejection
+          // must stay silent: the peer may already be gone at shutdown.
+          if (
+            result !== null &&
+            typeof result === 'object' &&
+            typeof (result as PromiseLike<void>).then === 'function'
+          ) {
+            ;(result as PromiseLike<void>).then(undefined, () => {})
+          }
+        }
+      } catch {
+        // Nothing left to release.
+      }
+    } catch (error) {
+      console.error(`${LOG_PREFIX} dispose degraded: ${describeError(error)}`)
     }
-    state.peerId = undefined
   }
 }
