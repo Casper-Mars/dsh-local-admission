@@ -100,7 +100,7 @@ execFileSync(pnpmBin, ['install', '--dir', anonOffDir], {
 copyProfile(template, anonDir)
 console.log(`[setup] copied ${template} -> ${anonDir}`)
 
-console.log('[setup] linking dsh-bypass-web-token into the anon profile')
+console.log('[setup] linking dsh-local-admission into the anon profile')
 execFileSync(dshBin, ['plugin', '--profile', 'anon', 'add', projectRoot], {
   stdio: 'inherit',
   env: { ...process.env, DSH_HOME: dshHome },

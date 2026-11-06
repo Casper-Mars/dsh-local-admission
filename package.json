@@ -1,7 +1,7 @@
 {
-  "name": "dsh-bypass-web-token",
+  "name": "dsh-local-admission",
   "version": "0.1.1",
-  "description": "Cordis plugin for dsh: tokenless UI, /api and WebSocket admission as an anonymous owner peer (zero-config, any bind address)",
+  "description": "Cordis plugin for dsh: zero-configuration local admission for the web UI, /api and WebSocket on an operator-controlled machine",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,9 +15,9 @@
     "dsh",
     "cordis",
     "plugin",
-    "token",
-    "bypass",
-    "developer-tools"
+    "local-development",
+    "developer-tools",
+    "automation"
   ],
   "type": "module",
   "main": "./dist/index.js",

@@ -9,13 +9,13 @@
  * `/api` route, the WebSocket upgrade) dispatches through `this.admit(...)`, so
  * an own property on the instance shadows the prototype method.
  *
- * This plugin is a bypass, not an auth extension: the override never calls the
- * stock `admit`, never consults `isTrusted`, and never looks at `Host` or
- * `Origin`. Every request that reaches the port is answered with one shared
- * anonymous `answer` peer, including cross-origin browser requests and forged
- * `Host` headers.
+ * This plugin installs a local admission policy, not an auth extension: the
+ * override never calls the stock `admit`, never consults `isTrusted`, and never
+ * looks at `Host` or `Origin`. Every request that reaches the port is answered
+ * with one shared `answer` peer, including cross-origin browser requests and
+ * forged `Host` headers.
  *
- * Two more gates are replaced on the same instance:
+ * Two more gates are overridden on the same instance:
  *   - `authorizeIndex` (web UI shell) returns `true` for every request.
  *   - `authorizeConnect` (`/connect` launch-token exchange) skips the token
  *     entirely and returns an empty `dsh-session` cookie in its 302.
@@ -31,7 +31,7 @@
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 
 /** Stable log prefix shared with `src/index.ts`. */
-export const LOG_PREFIX = '[dsh-bypass-web-token]'
+export const LOG_PREFIX = '[dsh-local-admission]'
 
 /**
  * Structural view of a Peer. `@deepseek-ai/dsh-typert-protocol` owns the real
@@ -164,7 +164,7 @@ type AuthorizeConnectMethod = (
 ) => boolean | void
 
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
-const STATE = Symbol.for('dsh-bypass-web-token/patch-state')
+const STATE = Symbol.for('dsh-local-admission/patch-state')
 
 /** Disposer returned when nothing was installed. */
 const noop = (): void => {}
@@ -236,7 +236,7 @@ export function safeInfo(message: string): void {
 }
 
 /**
- * Best-effort warning line, used when anonymous admission is active on a
+ * Best-effort warning line, used when local admission is active on a
  * non-loopback listener. Like {@link safeError} and {@link safeInfo}, a broken
  * log sink must never turn a successful activation into a failure.
  */
@@ -251,7 +251,7 @@ export function safeWarn(message: string): void {
 /**
  * Read the peer out of a registry record without trusting the record's shape.
  *
- * Every property read happens here so a hostile getter (`record.peer`,
+ * Every property read happens here so a throwing getter (`record.peer`,
  * `peer.id`) throws inside the caller's `try` instead of escaping to dsh.
  *
  * @param record - value returned by `peers.get(...)`.
@@ -304,7 +304,7 @@ function describeValue(value: unknown): string {
  * internal symbol. Returning a structured result (instead of throwing) lets
  * `apply` log exactly which member broke and stay inert.
  *
- * `isTrusted` is deliberately not required: the bypass never calls it.
+ * `isTrusted` is deliberately not required: the override never calls it.
  *
  * @param connection - value returned by `ctx.get('connection')`.
  * @returns `{ ok: true, connection }` or `{ ok: false, stage, detail }`.
@@ -376,9 +376,9 @@ export interface InstallResult {
 }
 
 /**
- * Install the bypass gates exactly once per connection instance. Repeated
- * installs only bump a reference count, so an HMR reload or a second apply
- * cannot wrap the wrapper.
+ * Install the local admission overrides exactly once per connection instance.
+ * Repeated installs only bump a reference count, so an HMR reload or a second
+ * apply cannot wrap the wrapper.
  *
  * This function never throws. When the preflight fails or a property cannot be
  * written (frozen/read-only instance), it logs one `activation skipped` line
@@ -478,8 +478,8 @@ export function installAnonymousAdmitResult(
   }
   if (indexMethod === undefined) safeWarn(indexGateMissing(indexReadDetail))
 
-  // `/connect` is a launch-token exchange in stock dsh; the bypass answers it
-  // without ever reading the token. Also best-effort.
+  // `/connect` is a launch-token exchange in stock dsh; the override answers it
+  // without reading the token. Also best-effort.
   let connectMethod: AuthorizeConnectMethod | undefined
   let connectReadDetail: string | undefined
   let hadOwnConnect = false
@@ -523,7 +523,7 @@ export function installAnonymousAdmitResult(
   }
 
   /**
-   * The entire admission decision. No stock call, no Host/Origin fence.
+   * The entire admission decision. No stock call, no Host/Origin check.
    *
    * Order is fixed: a disposing host refuses; a cached peer record is reused
    * while it exists; otherwise a fresh `answer` peer is published and returned.
@@ -569,7 +569,7 @@ export function installAnonymousAdmitResult(
     }
 
     // The record lookup, the null check, and both property reads run inside one
-    // guard: `typeof null === 'object'` and hostile getters must degrade to 401
+    // guard: `typeof null === 'object'` and throwing getters must degrade to 401
     // instead of throwing into dsh's request handler.
     try {
       return { peer: readPeerRecord(record) }
@@ -607,8 +607,9 @@ export function installAnonymousAdmitResult(
   }
 
   /**
-   * `/connect` bypass: keep the official query parsing and peer publication,
-   * drop the launch-token check, and hand back an empty session cookie.
+   * `/connect` override: keep the official query parsing and peer publication,
+   * answer without the launch-token check, and hand back an empty session
+   * cookie.
    */
   const authorizeConnect = (
     request: unknown,

@@ -14,7 +14,7 @@
  * unauthenticated entry points:
  *   GET /                              -> the web UI shell (connection.authorizeIndex)
  *   GET /api/__probe__                 -> the `/api` HTTP admission gate (connection.admit)
- *   GET /api/__probe__ + evil Origin   -> proves the Host/Origin fence is gone
+ *   GET /api/__probe__ + cross-origin Origin -> proves the Host/Origin check is no longer applied
  *   GET /connect?interactions=answer   -> launch-token exchange (authorizeConnect)
  *   GET /api/remote.mux                -> the WebSocket upgrade gate (admitConnection)
  *
@@ -252,7 +252,7 @@ async function runProfile(profile, host, port, accept) {
     const evil = await probeStatus(host, port, { Origin: 'http://evil.example.com' })
     const connect = await probeConnect(host, port)
     const index = await probeIndex(host, port)
-    // The bypass hands back an empty `dsh-session` cookie: present, unsigned.
+    // The override hands back an empty `dsh-session` cookie: present, unsigned.
     const emptyCookie =
       connect.setCookie.startsWith('dsh-session=;') &&
       connect.setCookie.slice('dsh-session='.length, connect.setCookie.indexOf(';')) === ''
@@ -310,7 +310,7 @@ try {
   )
   check(
     loopbackOff.evil === 403,
-    `loopback anon-off: GET /api/__probe__ with evil Origin is 403 (got ${loopbackOff.evil})`,
+    `loopback anon-off: GET /api/__probe__ with cross-origin Origin is 403 (got ${loopbackOff.evil})`,
   )
   check(
     loopbackOff.connect === 401,
@@ -321,7 +321,7 @@ try {
     `loopback anon-off: GET /api/remote.mux upgrade is 401 (got ${loopbackOff.ws})`,
   )
   check(
-    !loopbackOff.output.includes('[dsh-bypass-web-token]'),
+    !loopbackOff.output.includes('[dsh-local-admission]'),
     'loopback anon-off: plugin stayed silent',
   )
 
@@ -343,7 +343,7 @@ try {
   )
   check(
     loopbackOn.evil === 404,
-    `loopback anon: GET /api/__probe__ with evil Origin is 404 (no Host/Origin fence, got ${loopbackOn.evil})`,
+    `loopback anon: GET /api/__probe__ with cross-origin Origin is 404 (no Host/Origin check, got ${loopbackOn.evil})`,
   )
   check(
     loopbackOn.connect === 302 && loopbackOn.emptyCookie,
@@ -355,7 +355,7 @@ try {
   )
   check(
     loopbackOn.output.includes(
-      `[dsh-bypass-web-token] loopback listener ${LOOPBACK}: anonymous requests are admitted as an owner peer`,
+      `[dsh-local-admission] local admission is active on loopback listener ${LOOPBACK} — clients are treated as the owner principal`,
     ),
     'loopback anon: plugin logged the loopback admission notice',
   )
@@ -377,7 +377,7 @@ try {
   )
   check(
     lanOff.evil === 403,
-    `LAN anon-off: GET /api/__probe__ with evil Origin is 403 on ${lanIp} (got ${lanOff.evil})`,
+    `LAN anon-off: GET /api/__probe__ with cross-origin Origin is 403 on ${lanIp} (got ${lanOff.evil})`,
   )
   check(
     lanOff.connect === 401,
@@ -388,7 +388,7 @@ try {
     `LAN anon-off: GET /api/remote.mux upgrade is 401 on ${lanIp} (got ${lanOff.ws})`,
   )
   check(
-    !lanOff.output.includes('[dsh-bypass-web-token]'),
+    !lanOff.output.includes('[dsh-local-admission]'),
     'LAN anon-off: plugin stayed silent',
   )
 
@@ -405,7 +405,7 @@ try {
   )
   check(
     lanOn.evil === 404,
-    `LAN anon: GET /api/__probe__ with evil Origin is 404 (no Host/Origin fence, got ${lanOn.evil})`,
+    `LAN anon: GET /api/__probe__ with cross-origin Origin is 404 (no Host/Origin check, got ${lanOn.evil})`,
   )
   check(
     lanOn.connect === 302 && lanOn.emptyCookie,
@@ -416,7 +416,7 @@ try {
     `LAN anon: GET /api/remote.mux upgrade is 101 (got ${lanOn.ws})`,
   )
   check(
-    lanOn.output.includes('[dsh-bypass-web-token] WARNING:') &&
+    lanOn.output.includes('[dsh-local-admission] WARNING:') &&
       lanOn.output.includes(`non-loopback listener ${lanIp}`),
     'LAN anon: plugin warned about non-loopback owner access',
   )

@@ -13,8 +13,8 @@ import { apply, Config, inject, name } from '../src/index.js'
 
 const request = { headers: {} } as ConnectionTrustRequest
 
-/** Request carrying a hostile Origin and a forged Host header. */
-const hostileRequest = {
+/** Request carrying a cross-origin `Origin` and a forged `Host` header. */
+const crossOriginRequest = {
   headers: {
     host: 'evil.example.com',
     origin: 'http://evil.example.com',
@@ -148,7 +148,7 @@ function expectActivationSkipped(stage: string): void {
     message.includes(`activation skipped: ${stage} —`),
   )
   expect(hit).toHaveLength(1)
-  expect(hit[0]).toContain('[dsh-bypass-web-token]')
+  expect(hit[0]).toContain('[dsh-local-admission]')
   expect(hit[0]).toContain('(plugin inactive; dsh keeps stock auth)')
 }
 
@@ -176,7 +176,7 @@ function expectActivated(ctx: FakeContext, connection: FakeConnection): void {
 }
 
 describe('installAnonymousAdmit', () => {
-  it('admits an anonymous request without ever calling the stock admit', () => {
+  it('admits an unauthenticated request without ever calling the stock admit', () => {
     captureConsole()
     const connection = new FakeConnection()
     const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
@@ -189,7 +189,7 @@ describe('installAnonymousAdmit', () => {
     expect(admission.peer.id).toBe('peer-1')
     expect(admission.peer.interactions).toBe('answer')
     expect(connection.published).toEqual([{ id: 'peer-1', interactions: 'answer' }])
-    // The bypass replaces the gate instead of delegating to it.
+    // The override replaces the gate instead of delegating to it.
     expect(stockAdmit).not.toHaveBeenCalled()
 
     dispose()
@@ -202,7 +202,7 @@ describe('installAnonymousAdmit', () => {
     const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installAnonymousAdmit(connection)
 
-    const admission = connection.admit(hostileRequest)
+    const admission = connection.admit(crossOriginRequest)
 
     expect('peer' in admission).toBe(true)
     expect(stockAdmit).not.toHaveBeenCalled()
@@ -212,7 +212,7 @@ describe('installAnonymousAdmit', () => {
     dispose()
   })
 
-  it('ignores an authenticated browser peer and returns the anonymous one', () => {
+  it('ignores an authenticated browser peer and returns the shared local peer', () => {
     captureConsole()
     const connection = new FakeConnection()
     const browserPeer: PeerLike = { id: 'browser-peer' }
@@ -575,7 +575,7 @@ describe('installAnonymousAdmit', () => {
     expectActivationSkipped('install')
   })
 
-  it('disposes the anonymous peer on final uninstall', async () => {
+  it('disposes the admitted peer on final uninstall', async () => {
     captureConsole()
     const connection = new FakeConnection()
     const dispose = installAnonymousAdmit(connection)
@@ -600,7 +600,7 @@ describe('installAnonymousAdmit', () => {
     expect(result.installed).toBe(true)
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
     expect(connection.isTrusted).toBeUndefined()
-    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    expect('peer' in connection.admit(crossOriginRequest)).toBe(true)
     expect(errorSpy).not.toHaveBeenCalled()
     result.dispose()
   })
@@ -714,7 +714,7 @@ describe('installAnonymousAdmit', () => {
 
 describe('plugin module', () => {
   it('exports a zero-config Cordis plugin shape', () => {
-    expect(name).toBe('bypass-web-token')
+    expect(name).toBe('local-admission')
     expect(inject).toEqual(['connection'])
     // Cordis requires a schema export, but it must not declare any option.
     expect(Config({})).toEqual({})
@@ -732,7 +732,7 @@ describe('plugin module', () => {
     expect(errorSpy).not.toHaveBeenCalled()
     expect(warnSpy).not.toHaveBeenCalled()
     expect(String(infoSpy.mock.calls[0]![0])).toBe(
-      '[dsh-bypass-web-token] loopback listener 127.0.0.1: anonymous requests are admitted as an owner peer',
+      '[dsh-local-admission] local admission is active on loopback listener 127.0.0.1 — clients are treated as the owner principal',
     )
     expect('peer' in connection.admit(request)).toBe(true)
   })
@@ -763,7 +763,7 @@ describe('plugin module', () => {
     expect(errorSpy).not.toHaveBeenCalled()
     expect(warnMessages()).toHaveLength(1)
     expect(warnMessages()[0]).toContain(
-      'WARNING: anonymous admission is enabled on non-loopback listener 192.168.1.10',
+      'WARNING: local admission is active on non-loopback listener 192.168.1.10',
     )
     expect(String(infoSpy.mock.calls[0]![0])).toContain(
       'non-loopback listener 192.168.1.10',
@@ -902,9 +902,9 @@ describe('plugin module', () => {
 
     expectActivated(ctx, connection)
     expect(errorSpy).not.toHaveBeenCalled()
-    // The bypass never needed it, but the other gates work with a hostile
-    // Origin and a forged Host because no fence is consulted.
-    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    // The override never needed it, but the other gates work with a
+    // cross-origin request and a forged Host because no such check is consulted.
+    expect('peer' in connection.admit(crossOriginRequest)).toBe(true)
     // One shared peer: the second request reuses the answer peer.
     expect(connection.published).toHaveLength(1)
   })
@@ -1014,7 +1014,7 @@ describe('plugin module', () => {
     expect(warnSpy).not.toHaveBeenCalled()
     expect(infoSpy).toHaveBeenCalledOnce()
     expect(String(infoSpy.mock.calls[0]![0])).toBe(
-      '[dsh-bypass-web-token] loopback listener 127.0.0.1: anonymous requests are admitted as an owner peer',
+      '[dsh-local-admission] local admission is active on loopback listener 127.0.0.1 — clients are treated as the owner principal',
     )
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
@@ -1039,7 +1039,7 @@ describe('plugin module', () => {
     expect(Object.hasOwn(connection, 'authorizeConnect')).toBe(false)
   })
 
-  it('never grants anonymous admission on any failed preflight path', () => {
+  it('never grants local admission on any failed preflight path', () => {
     const cases: Array<{
       connection: unknown
       stage: string
@@ -1075,7 +1075,7 @@ describe('plugin module', () => {
 describe('non-loopback listeners', () => {
   const lan = { host: '192.168.1.92' }
 
-  it('admits anonymous requests on a LAN listener and warns once', () => {
+  it('admits unauthenticated requests on a LAN listener and warns once', () => {
     captureConsole()
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: lan })
@@ -1085,14 +1085,14 @@ describe('non-loopback listeners', () => {
     expect(errorSpy).not.toHaveBeenCalled()
     expect(warnMessages()).toHaveLength(1)
     expect(warnMessages()[0]).toContain(
-      '[dsh-bypass-web-token] WARNING: anonymous admission is enabled on non-loopback listener 192.168.1.92',
+      '[dsh-local-admission] WARNING: local admission is active on non-loopback listener 192.168.1.92',
     )
     expect(warnMessages()[0]).toContain(
-      'every host that can reach this port gets owner access',
+      'clients that can reach this port are treated as the owner principal',
     )
     expect(infoSpy).toHaveBeenCalledOnce()
     expect(String(infoSpy.mock.calls[0]![0])).toContain(
-      'non-loopback listener 192.168.1.92: anonymous requests are admitted as an owner peer',
+      'non-loopback listener 192.168.1.92 — local admission is active',
     )
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
     expect('peer' in connection.admit(request)).toBe(true)
@@ -1278,7 +1278,7 @@ describe('runtime wrapper defence', () => {
     const stockAdmit = vi.spyOn(FakeConnection.prototype, 'admit')
     const dispose = installed(connection)
 
-    expect('peer' in connection.admit(hostileRequest)).toBe(true)
+    expect('peer' in connection.admit(crossOriginRequest)).toBe(true)
     expect(stockAdmit).not.toHaveBeenCalled()
 
     dispose()

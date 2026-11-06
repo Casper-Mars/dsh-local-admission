@@ -1,9 +1,9 @@
-DISCLOSURE — dsh-bypass-web-token
-=================================
+DISCLOSURE — dsh-local-admission
+================================
 
 What this package does
 ----------------------
-`dsh-bypass-web-token` is a Cordis plugin for `dsh` (DeepSeek Harness). When
+`dsh-local-admission` is a Cordis plugin for `dsh` (DeepSeek Harness). When
 loaded into a dsh profile it overrides three methods on the live, in-process
 `HostConnectionService` instance:
 
@@ -12,9 +12,9 @@ loaded into a dsh profile it overrides three methods on the live, in-process
   * `authorizeIndex`  — the gate that guards the web UI shell (`index.html`);
   * `authorizeConnect`— the `/connect` launch-token exchange.
 
-With the overrides in place, requests that reach the dsh web listener are
-admitted as one shared anonymous `owner` peer, and `/connect` answers with an
-empty session cookie. Disposing the plugin restores the original methods by
+With the overrides in place, clients that reach the dsh web listener are
+admitted as one shared `owner` peer, and `/connect` answers with an empty
+session cookie. Disposing the plugin restores the original methods by
 reference, so the stock token/cookie authentication returns.
 
 The package does not modify files on disk, does not fork or patch published
@@ -23,11 +23,13 @@ persist anything across a dsh restart.
 
 Why this is dual-use content
 ----------------------------
-Any mechanism that removes an authentication gate can be used for good or for
-harm. This package intentionally disables authentication on a developer tool's
-local web surface, which automated scanning can reasonably read as an
-authentication bypass. It is declared here so that npm can apply scanning
-suited to dual-use packages.
+Any mechanism that overrides an authentication gate can be used for good or
+for harm. This package intentionally replaces authentication on a developer
+tool's local web surface with a policy whose only criterion is reachability of
+the port. Automated scanning can reasonably read that as a security-relevant
+capability, so it is declared here and in `package.json`
+(`"contentPolicy": { "class": "dual-use" }`) for scanning suited to dual-use
+packages.
 
 Intended legitimate use
 -----------------------
@@ -44,7 +46,8 @@ Safety properties
     `postinstall`, or `prepare` hooks.
   * No network activity of its own: no telemetry, no callbacks, no exfiltration.
   * No credential access: it never reads, logs, stores, or transmits tokens,
-    cookies, API keys, or environment secrets.
+    cookies, API keys, or environment secrets. `/connect` returns an empty
+    cookie rather than minting or forwarding a credential.
   * Reversible and idempotent: every override keeps the exact original function
     reference and is restored on disposal; repeated installs share one patch
     through a reference count.

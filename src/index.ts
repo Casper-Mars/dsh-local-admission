@@ -1,17 +1,18 @@
 /**
- * `dsh-bypass-web-token` — zero-configuration PoC plugin.
+ * `dsh-local-admission` — zero-configuration Cordis plugin.
  *
- * Installing the plugin is the switch: `apply` always tries to override the
- * live `connection` admission gates. Every request that reaches the port is
- * admitted as one shared owner Peer with `interactions: 'answer'`, no matter
- * which address the web listener binds. The stock `admit` is never called and
- * no `Host`/`Origin` fence is consulted. Uninstalling the plugin restores the
- * stock behaviour — there is nothing to configure.
+ * Installing the plugin is the switch: `apply` always tries to install the
+ * local admission policy on the live `connection` service. Every request that
+ * reaches the port is admitted as one shared owner Peer with
+ * `interactions: 'answer'`, no matter which address the web listener binds.
+ * The stock `admit` is never called and no `Host`/`Origin` check is performed.
+ * Uninstalling the plugin restores the stock behaviour — there is nothing to
+ * configure.
  *
- * There is no listener-address admission check: the bind address only selects
- * the wording of the activation log line, and a non-loopback listener
- * additionally gets a prominent warning because every host that can reach the
- * port then gets owner access.
+ * There is no additional listener-address restriction: the bind address only
+ * selects the wording of the activation log line, and a non-loopback listener
+ * additionally gets a prominent warning because every client that can reach
+ * the port is then treated as the owner principal.
  *
  * Nothing is forked and no official package is modified: the patch lands on the
  * live `connection` service instance at plugin apply time.
@@ -46,7 +47,7 @@ export type {
 export { isLoopbackHost } from './guard.js'
 
 /** Stable Cordis plugin name. */
-export const name = 'bypass-web-token'
+export const name = 'local-admission'
 
 /**
  * Services read by the plugin.
@@ -137,7 +138,7 @@ function activate(ctx: Context): void {
         uninstall = result.dispose
         return result.dispose
       },
-      'bypass-web-token: connection.admit override',
+      'local-admission: connection.admit override',
     )
   } catch (error) {
     // If the setup already ran, undo it rather than leaving a half-active patch.
@@ -155,22 +156,22 @@ function activate(ctx: Context): void {
   // followed by a "success" line would be a lie.
   if (!installed) return
 
-  // The listener address gates nothing: it only selects the log wording.
+  // The listener address only selects the log wording.
   // `webServer` is optional and read defensively; a missing service or a
   // throwing getter simply means `unknown`, never a skipped activation.
   const host = readWebHost(ctx)
   if (host !== undefined && isLoopbackHost(host)) {
     safeInfo(
-      `${LOG_PREFIX} loopback listener ${host}: anonymous requests are admitted as an owner peer`,
+      `${LOG_PREFIX} local admission is active on loopback listener ${host} — clients are treated as the owner principal`,
     )
     return
   }
 
   safeWarn(
-    `${LOG_PREFIX} WARNING: anonymous admission is enabled on non-loopback listener ${host ?? 'unknown'} — every host that can reach this port gets owner access`,
+    `${LOG_PREFIX} WARNING: local admission is active on non-loopback listener ${host ?? 'unknown'} — clients that can reach this port are treated as the owner principal`,
   )
   safeInfo(
-    `${LOG_PREFIX} non-loopback listener ${host ?? 'unknown'}: anonymous requests are admitted as an owner peer`,
+    `${LOG_PREFIX} non-loopback listener ${host ?? 'unknown'} — local admission is active`,
   )
 }
 

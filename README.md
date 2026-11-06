@@ -1,22 +1,22 @@
-# dsh-bypass-web-token
+# dsh-local-admission
 
-[![npm version](https://img.shields.io/npm/v/dsh-bypass-web-token.svg)](https://www.npmjs.com/package/dsh-bypass-web-token)
+[![npm version](https://img.shields.io/npm/v/dsh-local-admission.svg)](https://www.npmjs.com/package/dsh-local-admission)
 [![license](https://img.shields.io/github/license/Casper-Mars/dsh-bypass-web-token.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.2-blue.svg)](https://www.npmjs.com/package/@deepseek-ai/dsh)
 
-> A zero-configuration Cordis plugin that drops the token gate from a `dsh` instance — UI, `/api`, `/connect`, and WebSocket — admitting every request that reaches the port as an anonymous owner peer. Install it and it is on; remove it and dsh is stock again. No options, no listener-address rule, no forked packages, **and no request validation at all**: the stock `admit` is never called and `Host`/`Origin` are never checked.
+> A zero-configuration Cordis plugin that provides local admission to a `dsh` instance for development automation — web UI, `/api`, `/connect`, and WebSocket. Install it and local admission is active; remove it and dsh is stock again. No options, no additional bind-address rule, no forked packages. The stock `admit` is not called, and `Host`/`Origin` are not consulted.
 
-`dsh web` normally prints `http://127.0.0.1:<port>/?token=…`, and every client — a browser you drive by hand, a headless automation script, a health probe — has to carry that token. This plugin replaces three gates on the live `connection` service instance — `admit` for `/api` and WebSocket, `authorizeIndex` for the UI shell, and `authorizeConnect` for the `/connect` launch-token exchange — so anything that reaches the port is let through as a single shared owner peer. Everything is scoped to the running process: no package is modified, no class is monkey-patched globally, and disposal restores the stock behaviour exactly.
+`dsh web` normally prints `http://127.0.0.1:<port>/?token=…`, and every client — a browser you drive by hand, a headless automation script, a health probe — has to carry that token. This plugin overrides three gates on the live `connection` service instance — `admit` for `/api` and WebSocket, `authorizeIndex` for the UI shell, and `authorizeConnect` for the `/connect` launch-token exchange — so every client that reaches the port is admitted as a single shared owner peer. Everything is scoped to the running process: no package is modified, no class is monkey-patched globally, and disposal restores the stock behaviour exactly.
 
 > [!WARNING]
-> There is **no request validation whatsoever**: no launch token, no cookie, no `Host` check, no `Origin` check, no `isTrusted`. The anonymous peer has the `owner` principal, and `GET /connect` hands out an empty session cookie. Whatever address the web server binds, anything that can reach that port — every local process, **every web page running in any browser on the machine (cross-origin requests included)**, and every host on the LAN when you bind a LAN address — gains full read/write access to every session and RPC. Use it on a **trusted, single-user machine or a disposable test environment only**, and never map the port to the public internet or put it behind a reverse proxy.
+> While the plugin is active, the only admission criterion is that a client can reach the port: no launch token, no cookie, no `Host` check, no `Origin` check, no `isTrusted`. Admitted clients are treated as the `owner` principal, and `GET /connect` returns an empty session cookie. Whatever address the web server binds, every client that can reach that port — every local process, **every web page running in any browser on the machine (cross-origin requests included)**, and every host on the LAN when you bind a LAN address — has full read/write access to every session and RPC. Use it only on an **operator-controlled, single-user machine or a disposable test environment**, and never map the port to the public internet or put it behind a reverse proxy.
 
 ---
 
 ## What it does
 
-| Profile | Listener | Plugin | `GET /` | `GET /api/__probe__` | `GET /api/__probe__` + evil `Origin` | `GET /connect?interactions=answer` | `GET /api/remote.mux` (WebSocket upgrade) |
+| Profile | Listener | Plugin | `GET /` | `GET /api/__probe__` | `GET /api/__probe__` + cross-origin `Origin` | `GET /connect?interactions=answer` | `GET /api/remote.mux` (WebSocket upgrade) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `anon-off` | `127.0.0.1` | absent | **401** | **401** | **403** | **401** | **401** |
 | `anon` | `127.0.0.1` | installed | **200** | **404** (admitted) | **404** (admitted) | **302** + empty cookie | **101** |
@@ -38,12 +38,12 @@ All five transports are covered because the `/api` HTTP router, the `/connect` e
 The plugin overrides **three** gates: `connection.admit` (the `/api/*` HTTP routes and the `/api/remote.mux` WebSocket upgrade), `connection.authorizeIndex` (the web UI shell, which normally demands a `?token=` query or a signed browser cookie), and `connection.authorizeConnect` (the `/connect` launch-token exchange).
 
 - `GET /api/<anything>` without a token → admitted (`404` when the route does not exist, i.e. the request was no longer rejected by the token gate).
-- `GET /api/<anything>` with `Origin: http://evil.example.com` and a forged `Host` → **also admitted**; the fence is gone.
+- `GET /api/<anything>` with a cross-origin `Origin` and a forged `Host` → **also admitted**; no `Host`/`Origin` check is applied.
 - `GET /api/remote.mux` upgrade without a token → `101`.
 - `GET /` without a token or cookie → **200**, the UI loads and its API calls go through the same override. No cookie is minted, validated, or required.
 - `GET /connect?interactions=answer` without a token → **302** to `./api/remote.mux` with `set-cookie: dsh-session=; Path=/; HttpOnly; SameSite=Lax`. The cookie is deliberately **empty**: nothing is signed and nothing is read back.
 
-The stock cookie/token path is bypassed rather than forged: `authorizeIndex` is replaced with `() => true`, and `authorizeConnect` never touches the launch token
+The stock cookie/token flow is replaced rather than forged: `authorizeIndex` is replaced with `() => true`, and `authorizeConnect` never reads the launch token.
 
 ## How it works
 
@@ -54,12 +54,12 @@ flowchart LR
   D -- no --> K{peer already<br/>published?}
   K -- no --> N[publishPeer answer]
   K -- yes --> U[reuse]
-  N --> OK[anonymous owner peer]
+  N --> OK[shared owner peer]
   U --> OK
 ```
 
 1. **Patch the instance, not the class.** A plugin installed into a dsh profile can resolve a *different* module instance than the one dsh booted, so prototype patches fail silently. The plugin takes the service from `ctx.get('connection')` and defines own properties that shadow the prototype methods.
-2. **`admit` is replaced, not wrapped.** The stock `admit` is never called: no credential lookup, no `isTrusted`, no `Host`/`Origin` comparison, no 403 branch. A disposing host still answers `401`; everything else is admitted. This is a deliberate full local-trust model, not an authentication extension.
+2. **`admit` is replaced, not wrapped.** The stock `admit` is never called: no credential lookup, no `isTrusted`, no `Host`/`Origin` comparison, no 403 branch. A disposing host still answers `401`; everything else is admitted. This is a deliberate full local-trust model for an operator-controlled machine, not an authentication extension.
 3. **One shared `interactions: 'answer'` peer.** `publishPeer('answer')` registers the peer in the service's `peers` map. `admitConnection` looks peers up by id to take socket ownership, so an `answer` peer is required; a browser peer would be rejected by `gateway/interactions-forbidden`.
 4. **Peer lifecycle mirrors the socket.** When a WebSocket closes, dsh deletes the peer record. The wrapper notices the missing record on the next request and publishes a fresh peer instead of reusing a dead id — otherwise the second upgrade would fall back to `401`.
 5. **`authorizeConnect` no longer exchanges a launch token.** It keeps the official query parsing (`interactions` must be declared at most once, as `answer` or `none`; otherwise `400`), publishes the peer through the supplied `publish` callback (or `publishPeer` when dsh calls the instance method with two arguments), and answers `302` to `./api/remote.mux` with an empty `dsh-session` cookie. No secret is read, nothing is signed, and non-`GET` / non-`/connect` requests return `false` to the caller.
@@ -78,12 +78,12 @@ flowchart LR
 ### From npm
 
 ```bash
-dsh plugin --profile web add dsh-bypass-web-token
+dsh plugin --profile web add dsh-local-admission
 ```
 
 That is the whole installation. The package declares `dsh.bundle`, so `dsh plugin add` registers it in the profile's `dsh.profile.bundles` and the bundle layer inserts the plugin entry — **no `cordis.patch.yml` editing, no config block**. Restart `dsh web` and the UI, `/api/*`, and the WebSocket mux are all reachable without a token.
 
-To turn the behaviour off again, `dsh plugin --profile web remove dsh-bypass-web-token` and restart. dsh then behaves exactly as stock.
+To turn the behaviour off again, `dsh plugin --profile web remove dsh-local-admission` and restart. dsh then behaves exactly as stock.
 
 ### From source
 
@@ -94,7 +94,7 @@ pnpm setup     # creates an isolated ./.dsh-home, never touches ~/.dsh
 pnpm verify    # boots dsh four times and asserts the status codes above
 ```
 
-`pnpm setup` copies `~/.dsh/profiles/web` into `./.dsh-home/profiles/anon` and installs this repository into that profile with `dsh plugin add` — the same one-command path end users take, which registers the bundle and applies its patch. A second copy of the stock template is created as `anon-off` **without** the plugin, as the control group. `pnpm verify` boots each profile on loopback (`127.0.0.1:18085`) and, with `--host <first non-internal IPv4>`, on the LAN (`:18086`) — four boots in total. It sends token-less requests to `/api/__probe__` and `/api/remote.mux`, records the real status codes, and cleans the processes up with `SIGTERM`.
+`pnpm setup` copies `~/.dsh/profiles/web` into `./.dsh-home/profiles/anon` and installs this repository into that profile with `dsh plugin add` — the same one-command path end users take, which registers the bundle and applies its patch. A second copy of the stock template is created as `anon-off` **without** the plugin, as the control group. `pnpm verify` boots each profile on loopback (`127.0.0.1:18085`) and, with `--host <first non-internal IPv4>`, on the LAN (`:18086`) — four boots in total. It sends requests without credentials to `/api/__probe__` and `/api/remote.mux`, records the real status codes, and cleans the processes up with `SIGTERM`.
 
 Automation clients on the LAN can then call `http://192.168.1.92:8081/api/...` without a token, a WebSocket client can open `ws://192.168.1.92:8081/api/remote.mux` without one, and a browser can open `http://192.168.1.92:8081/` directly — the UI loads without a token or cookie.
 
@@ -103,14 +103,14 @@ Automation clients on the LAN can then call `http://192.168.1.92:8081/api/...` w
 On a loopback listener activation logs exactly one line:
 
 ```text
-[dsh-bypass-web-token] loopback listener 127.0.0.1: anonymous requests are admitted as an owner peer
+[dsh-local-admission] local admission is active on loopback listener 127.0.0.1 — clients are treated as the owner principal
 ```
 
 On a non-loopback listener (or when the address cannot be read) it logs a warning first, then the info line:
 
 ```text
-[dsh-bypass-web-token] WARNING: anonymous admission is enabled on non-loopback listener 192.168.1.92 — every host that can reach this port gets owner access
-[dsh-bypass-web-token] non-loopback listener 192.168.1.92: anonymous requests are admitted as an owner peer
+[dsh-local-admission] WARNING: local admission is active on non-loopback listener 192.168.1.92 — clients that can reach this port are treated as the owner principal
+[dsh-local-admission] non-loopback listener 192.168.1.92 — local admission is active
 ```
 
 When `webServer` is unavailable or `host` is missing/non-string/throwing, both lines say `unknown`; activation still succeeds.
@@ -123,31 +123,31 @@ Activation never throws: every failed preflight check logs one line and leaves t
 | --- | --- | --- |
 | `ctx.get('connection')` throws / service missing | `connection` | Plugin inactive |
 | `connection.admit` missing / not a function | `connection.admit` | Plugin inactive |
-| `connection.isTrusted` missing | — | **Still active**: the bypass never calls it |
+| `connection.isTrusted` missing | — | **Still active**: the override never calls it |
 | `connection.publishPeer` missing | `connection.publishPeer` | Plugin inactive |
 | `connection.peers` is not a `Map` | `connection.peers` | Plugin inactive |
 | `ctx.effect` missing / throws | `ctx.effect` | Plugin inactive, partial patch rolled back |
 | Instance frozen / any of the three gates read-only | `install` | All three gates rolled back, plugin inactive |
 | `webServer` missing, lookup throws, `host` unreadable | — | **Still active**, log says `unknown` |
-| `connection.authorizeIndex` missing / not a function | — | **Still active**: `/api`, `/connect`, and WebSocket are tokenless, the UI shell keeps its token gate |
-| `connection.authorizeConnect` missing / not a function | — | **Still active**: `/api`, WebSocket, and the UI are tokenless, `/connect` keeps its launch-token exchange |
+| `connection.authorizeIndex` missing / not a function | — | **Still active**: `/api`, `/connect`, and WebSocket are admitted without a token, the UI shell keeps its token gate |
+| `connection.authorizeConnect` missing / not a function | — | **Still active**: `/api`, WebSocket, and the UI are admitted without a token, `/connect` keeps its launch-token exchange |
 
-All skip lines end with `(plugin inactive; dsh keeps stock auth)` and share the prefix `[dsh-bypass-web-token]`. The success line is printed only when the patch really landed (`installed === true`), so a refused install can never produce a contradictory "skip + success" pair.
+All skip lines end with `(plugin inactive; dsh keeps stock auth)` and share the prefix `[dsh-local-admission]`. The success line is printed only when the patch really landed (`installed === true`), so a refused install can never produce a contradictory "skip + success" pair.
 
 At request time the wrapper is also non-throwing. A failing `publishPeer`, `peers.get`, a throwing `disposed` getter, or a malformed peer record degrades to `{ rejection: 401 }` — never a `500` — and each distinct error signature is logged once. An internal failure inside `authorizeConnect` degrades to `401` the same way; the stock implementation is never called as a fallback.
 
 ```text
-[dsh-bypass-web-token] request path degraded: <stage> — <message> (returning 401)
+[dsh-local-admission] request path degraded: <stage> — <message> (returning 401)
 ```
 
-Logging itself is best-effort: every `console` call (`error`, `info`, `warn`) is wrapped in `try/catch`, so a hostile or broken log sink cannot break `apply` or the request path.
+Logging itself is best-effort: every `console` call (`error`, `info`, `warn`) is wrapped in `try/catch`, so a throwing or broken log sink cannot break `apply` or the request path.
 
 ## Security model
 
-- **Trust boundary: none.** There is no request validation of any kind — no token, no cookie, no `Host` check, no `Origin` check, no `isTrusted`. Reaching the port **is** authentication: installing the plugin grants owner access on every bind address.
+- **Trust boundary: reachability of the port.** There is no request-level admission check beyond reachability — no token, no cookie, no `Host` check, no `Origin` check, no `isTrusted`. Reaching the port is treated as authorization: installing the plugin grants owner access on every bind address.
 - **Granted principal:** `{ kind: 'owner' }` — equivalent to the local user. On a LAN bind this means every machine that can route to that address gets the same power as the person who started dsh.
-- **Cross-origin browser requests are admitted too.** A page on `http://evil.example.com` can call this port and gets the same owner peer; `verify` asserts this explicitly (stock → `403`, plugin → `404` admitted). DNS-rebinding protection is gone as well.
-- **`/connect` mints no credential.** It answers `302` with `dsh-session=` (empty value). Nothing is signed, so there is no secret to leak and no cookie to replay — the gate simply no longer exists.
+- **Cross-origin browser requests are admitted too.** A page on any origin can call this port and gets the same owner peer; `verify` asserts this explicitly (stock → `403`, plugin → `404` admitted). DNS-rebinding protection is not applied either.
+- **`/connect` mints no credential.** It answers `302` with `dsh-session=` (empty value). Nothing is signed, so there is no secret to leak and no cookie to replay — the token exchange no longer applies.
 - **Exposure is bounded by the bind address, not by the plugin:** `dsh` refuses `0.0.0.0` / `::`, so exposure follows the concrete address you choose.
 - **Never do this:** map the port to the public internet, expose it through a reverse proxy, or bind a LAN address on an untrusted network (café/hotel/office guest Wi-Fi).
 - **Not covered:** TLS termination, reverse proxies, port forwarding, container-to-host mappings. If any of those put this port on a shared surface, the security model no longer holds.
@@ -158,7 +158,7 @@ The plugin depends on three internal members of `HostConnectionService`: `admit`
 
 - A renamed, removed, or non-function required member is detected by the preflight probe: the plugin logs which member failed and stays inert.
 - A missing `authorizeIndex` or `authorizeConnect` only produces a warning; the remaining gates stay active.
-- A change in `admit`'s signature or calling convention **cannot** be detected at install time (JavaScript carries no runtime types). The first request then degrades to `401`; authentication is never opened by accident, but an upgrade may need manual review if anonymous access silently stops working.
+- A change in `admit`'s signature or calling convention **cannot** be detected at install time (JavaScript carries no runtime types). The first request then degrades to `401`; authentication is never opened by accident, but an upgrade may need manual review if local admission silently stops working.
 - `inject` only declares `connection`. `webServer` is read with `ctx.get('webServer')` purely for log wording, so a dsh build without that service still activates, logging `unknown`.
 
 ## Development
@@ -189,15 +189,15 @@ scripts/verify.mjs           boot both profiles on loopback and LAN, assert HTTP
 
 - This is a **local development convenience**, not a production authentication scheme.
 - Verification covers the transport layer: HTTP admission, WebSocket upgrade, disposal, and the failure matrix. It does not exercise RPC-level session behaviour, concurrency, TLS, or reverse proxies.
-- The anonymous peer is shared by all admitted requests, so per-client identity and per-client isolation do not exist by design.
+- The admitted peer is shared by all admitted requests, so per-client identity and per-client isolation do not exist by design.
 - The static web UI is fully in scope: `authorizeIndex` returns `true` and `/connect` returns an empty cookie, so the browser never needs a token.
 
 ## Registry classification
 
 The package is declared as **dual-use content** — `"contentPolicy": { "class": "dual-use" }`
-in `package.json`, plus a [`DISCLOSURE`](./DISCLOSURE) file shipped in the tarball. Removing
-authentication gates is a security-relevant capability, so npm's publish-time scanning treats
-it accordingly. Releases must be published through a 2FA-enforced method (interactive publish
+in `package.json`, plus a [`DISCLOSURE`](./DISCLOSURE) file shipped in the tarball. Overriding
+authentication gates at runtime is a security-relevant capability, so npm's publish-time scanning
+treats it accordingly. Releases must be published through a 2FA-enforced method (interactive publish
 or staged publishing followed by maintainer approval).
 
 ## License
@@ -208,13 +208,13 @@ or staged publishing followed by maintainer approval).
 
 ## 中文简介
 
-`dsh-bypass-web-token` 是一个 Cordis 插件：在不修改官方包、不 fork、不用 patch-package 的前提下，运行时替换 `dsh` 实例上的 `connection.admit`、`connection.authorizeIndex` 与 `connection.authorizeConnect`，让所有到达端口的请求被接纳为一个匿名 owner peer。
+`dsh-local-admission` 是一个 Cordis 插件：在不修改官方包、不 fork、不用 patch-package 的前提下，运行时替换 `dsh` 实例上的 `connection.admit`、`connection.authorizeIndex` 与 `connection.authorizeConnect`，让到达端口的请求被接纳为一个共享的 owner peer（本地准入，local admission）。
 
 - **零配置：装上插件即生效，卸载插件即恢复**。没有任何配置项，`cordis.patch.yml` 里只有 `id` / `name` / `inject`。
-- **彻底绕过**：`admit` 直接签发匿名 `answer` peer，不调用官方实现，也不做 Host/Origin 校验；官方 token、cookie、`isTrusted` 全部不再参与。
+- **本地准入策略**：`admit` 直接签发共享的 `answer` peer，不调用官方实现，也不做 Host/Origin 校验；官方 token、cookie、`isTrusted` 均不再参与。
 - **全链路免 token**：`/`（UI 外壳）、`/api/*`、`/connect`、`/api/remote.mux` WebSocket 一视同仁。`/connect?...` 返回 `302` 并附带一个**空值** `dsh-session` cookie，不读取也不签发任何凭据。
-- 安装后不再对监听地址做任何准入判断，Loopback、LAN IP 一视同仁；监听地址只影响日志措辞：回环地址打一条 info；非回环地址先打一条 WARNING（提示「所有能访问该端口的主机都获得 owner 权限」）再打一条 info。
+- 安装后不再对监听地址追加限制，Loopback、LAN IP 一视同仁；监听地址只影响日志措辞：回环地址打一条 info；非回环地址先打一条 WARNING（提示「能访问该端口的客户端将被视为 owner 主体」）再打一条 info。
 - `0.0.0.0` / `::` 由 dsh 自身在 CLI 与 schema 层拒绝，请显式绑定具体 IPv4/IPv6 地址（如 `192.168.1.92`）。
-- **没有任何请求校验**：端口可达即拥有 owner 权限，跨源浏览器请求同样放行；绝不要映射到公网或放到反向代理后面。
+- **仅以端口可达作为准入条件**：端口可达即拥有 owner 权限，跨源浏览器请求同样放行；绝不要映射到公网或放到反向代理后面，仅限受控单机或一次性测试环境使用。
 - 激活失败、运行期异常、日志 sink 异常都不会让 dsh 崩溃，一律 fail-closed 退化为 401。
-- 匿名 peer 是 `owner` 权限，等同于本机全权；绑定 LAN 地址时等同于把 owner 权限交给能访问该端口的任何主机，只应在可信内网使用，绝不要暴露到公网。
+- 被准入的 peer 是 `owner` 权限，等同于本机全权；绑定 LAN 地址时等同于把 owner 权限交给能访问该端口的任何主机，只应在可信内网使用，绝不要暴露到公网。

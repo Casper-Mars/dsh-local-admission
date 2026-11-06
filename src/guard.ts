@@ -1,7 +1,7 @@
 /**
  * Pure loopback classification for a bind address / URL host.
  *
- * The plugin must never widen the trust fence by accident, so this predicate is
+ * The plugin must never widen the trust boundary by accident, so this predicate is
  * deliberately strict: only `localhost`, IPv4 `127/8`, IPv6 `::1`, and
  * IPv4-mapped loopback literals count. Wildcard addresses (`0.0.0.0`, `::`),
  * link-local, and any routable address are rejected.

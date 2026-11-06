@@ -1,13 +1,13 @@
-# dsh-bypass-web-token bundle patch.
+# dsh-local-admission bundle patch.
 #
 # Installing this package as a dsh plugin bundle is the only step required:
-# `dsh plugin --profile <p> add dsh-bypass-web-token` appends the package to the
+# `dsh plugin --profile <p> add dsh-local-admission` appends the package to the
 # profile's `dsh.profile.bundles` list and this layer inserts the plugin entry.
 # There is no config: the plugin activates unconditionally and restores the
 # stock admission gate when it is uninstalled.
 #
 # id/name/inject must match src/index.ts.
 - insert:
-    - id: bypass-web-token
-      name: dsh-bypass-web-token
+    - id: local-admission
+      name: dsh-local-admission
       inject: ['connection']
