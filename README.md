@@ -1,129 +1,193 @@
-# dsh-bypass-web-token（PoC）
+# dsh-bypass-web-token
 
-验证一个假设：**不改官方包、不 fork、不用 patch-package**，只靠一个 Cordis 插件，在运行时替换 `connection.admit`，让 loopback 上的内部 API 在**没有 token / cookie** 时也被接纳为一个 owner Peer。
+[![npm version](https://img.shields.io/npm/v/dsh-bypass-web-token.svg)](https://www.npmjs.com/package/dsh-bypass-web-token)
+[![license](https://img.shields.io/github/license/Casper-Mars/dsh-bypass-web-token.svg)](./LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
+[![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.2-blue.svg)](https://www.npmjs.com/package/@deepseek-ai/dsh)
 
-结论：可行。对照组 `anon-off` 稳定 401，实验组 `anon` 在 HTTP 与 WebSocket 两条传输上都通过鉴权。
+> A Cordis plugin that admits unauthenticated **loopback** traffic to a local `dsh` instance as an anonymous owner peer — without forking dsh, patching packages, or weakening the Host/Origin fence.
 
-## 实测结果
+`dsh web` normally prints `http://127.0.0.1:<port>/?token=…`, and every local client — a browser you drive by hand, a headless automation script, a health probe — has to carry that token. This plugin replaces the admission gate on the live `connection` service instance so that requests arriving over loopback are let through as a single shared owner peer. Everything is scoped to the running process: no package is modified, no class is monkey-patched globally, and disposal restores the stock behaviour exactly.
 
-| profile | `trustLoopback` | `GET /api/__probe__` | `GET /api/remote.mux`（WS upgrade） |
+> [!WARNING]
+> The anonymous peer has the `owner` principal. Anything that can reach the loopback port — every local process, every browser tab on this machine — gains full read/write access to every session and RPC. Use it on a **trusted, single-user machine or a disposable test environment only**. Never bind a non-loopback listener: the plugin refuses to activate in that case.
+
+---
+
+## What it does
+
+| Profile | `trustLoopback` | `GET /api/__probe__` | `GET /api/remote.mux` (WebSocket upgrade) |
 | --- | --- | --- | --- |
 | `anon-off` | `false` | **401** | **401** |
-| `anon` | `true` | **404**（已过 admit，只是没有该端点） | **101**（握手成功） |
+| `anon` | `true` | **404** (admitted — the probe route simply does not exist) | **101** (handshake completed) |
 
-```
+```text
 === summary ===
   anon-off probe=401  upgrade=401
   anon     probe=404  upgrade=101
 ```
 
-## 运行
+Both transports are covered because the `/api` HTTP router and the WebSocket upgrade path dispatch through the same `connection.admit(...)` method.
 
-前置：`dsh` 0.2.1-rc.2 在 PATH，Node ≥ 20，pnpm 11。
+## How it works
+
+```mermaid
+flowchart LR
+  C[HTTP request / WS upgrade] --> A[connection.admit]
+  A --> S{stock gate:<br/>token / cookie?}
+  S -- valid --> P[real peer]
+  S -- anonymous --> D{host disposing?}
+  D -- yes --> R401[401 rejection]
+  D -- no --> H{isTrusted:<br/>Host + Origin fence}
+  H -- no --> R403[403 rejection]
+  H -- yes --> K{peer already<br/>published?}
+  K -- no --> N[publishPeer answer]
+  K -- yes --> U[reuse]
+  N --> OK[owner peer]
+  U --> OK
+```
+
+1. **Patch the instance, not the class.** A plugin installed into a dsh profile can resolve a *different* module instance than the one dsh booted, so prototype patches fail silently. The plugin takes the service from `ctx.get('connection')` and defines an own `admit` property that shadows the prototype method.
+2. **The stock gate always runs first.** A request with a real browser/API credential is returned untouched, so authenticated traffic keeps its own peer.
+3. **The Host/Origin fence is not optional.** Before minting a peer the wrapper calls the original `isTrusted(request)`. Unrelated origins and forged `Host` headers still get `403` — enabling anonymous loopback access does not disable CSRF / DNS-rebinding protection.
+4. **One shared `interactions: 'answer'` peer.** `publishPeer('answer')` registers the peer in the service's `peers` map. `admitConnection` looks peers up by id to take socket ownership, so an `answer` peer is required; a browser peer would be rejected by `gateway/interactions-forbidden`.
+5. **Peer lifecycle mirrors the socket.** When a WebSocket closes, dsh deletes the peer record. The wrapper notices the missing record on the next request and publishes a fresh peer instead of reusing a dead id — otherwise the second upgrade would fall back to `401`.
+6. **Reversible and idempotent.** The exact original function reference is kept (no `bind` copy). Disposal writes it back, or deletes the own property when the method was inherited. Repeated installs share one patch through a `Symbol.for(...)` marker plus a reference count, so HMR reloads and duplicate `apply` calls cannot wrap the wrapper.
+
+## Requirements
+
+- Node.js **>= 20**
+- `dsh` **0.2.1-rc.2** (Cordis **4.0.5**)
+- The web listener must bind a loopback address: `localhost`, `127.0.0.0/8`, `::1`, or an IPv4-mapped loopback literal. Wildcards (`0.0.0.0`, `::`) and LAN addresses are refused.
+
+## Install
+
+### From npm
+
+```bash
+dsh plugin --profile web add dsh-bypass-web-token
+```
+
+Then enable it in the profile's `cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: bypass-web-token
+      name: dsh-bypass-web-token
+      inject: ['connection', 'webServer']
+      config:
+        trustLoopback: true
+```
+
+Restart `dsh web`. The listener keeps printing its usual token URL; requests that arrive without one are now admitted as the anonymous owner peer.
+
+To turn the behaviour off again, set `trustLoopback: false` (or remove the entry). The plugin then never installs anything and dsh behaves exactly as stock.
+
+### From source
 
 ```bash
 pnpm install
 pnpm build
-pnpm setup     # 创建隔离的 ./.dsh-home，不写 ~/.dsh
-pnpm verify    # 真启动两次 dsh，断言状态码
+pnpm setup     # creates an isolated ./.dsh-home, never touches ~/.dsh
+pnpm verify    # boots dsh twice and asserts the status codes above
 ```
 
-`pnpm setup` 做的事：
+`pnpm setup` copies `~/.dsh/profiles/web` into `./.dsh-home/profiles/anon`, links this repository into that profile, appends a `trustLoopback: true` entry, then clones the result as `anon-off` with the flag set to `false` for a control group. `pnpm verify` starts both profiles on port `18085`, sends token-less requests to `/api/__probe__` and `/api/remote.mux`, records the real status codes, and cleans the processes up with `SIGTERM`.
 
-1. 把 `~/.dsh/profiles/web` 复制到 `./.dsh-home/profiles/anon`（只读源 profile，不修改它）；
-2. `DSH_HOME=./.dsh-home dsh plugin --profile anon add <本仓库>`，把本包 link 进 profile；
-3. 在 `anon/cordis.patch.yml` 末尾追加一条 `insert` 配置（`trustLoopback: true`）；
-4. 再复制一份为 `anon-off`，把 `trustLoopback` 改成 `false` 作为对照组。
+## Configuration
 
-`pnpm verify` 会在 18085 端口依次启动两个 profile，用无 cookie 请求打 `/api/__probe__` 与 `/api/remote.mux`，记录真实状态码，结束后 SIGTERM 清理进程。
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `trustLoopback` | `boolean` | `false` | Admit unauthenticated loopback requests as an anonymous owner peer. When `false` the plugin installs nothing. |
 
-## 为什么这样实现
+`trustLoopback: true` is only honoured when the web listener itself is loopback. On any other address activation is skipped and dsh keeps serving with its stock token authentication.
 
-1. **不 import `HostConnectionService` 类。** 插件通过 link 进入 profile，模块实例很可能和 dsh 启动时加载的不是同一个，prototype patch 会静默失效。直接操作 `ctx.get('connection')` 返回的服务实例。
-2. **实例属性覆盖 prototype。** `requestRejection`、`admitConnection`、`/api` 路由、WebSocket upgrade 全部走 `this.admit(...)`，所以 `conn.admit = fn` 能覆盖所有入口。
-3. **匿名 Peer 必须是 `interactions: 'answer'`。** 用 `conn.publishPeer('answer')` 注册进 `conn.peers`，`{ peer: record.peer }` 才能被 `admitConnection` 接管（它要按 id 查 `peers` 才能建立 socket 所有权）。`browserPeer` 没有 answer，`$events` 会被 `gateway/interactions-forbidden` 拒绝。
-4. **Host/Origin 围栏保留。** 先执行 `conn.isTrusted(request)`，不可信一律 `{ rejection: 403 }`，不会因为开了匿名就把 CSRF/DNS-rebinding 防护一起关掉。
-5. **只在 loopback 生效（fail-closed）。** `apply` 读取 `webServer.host`；非 loopback 且 `trustLoopback: true` 时插件**跳过激活**，只打印一行 console 错误：
+## Failure modes
 
-   ```
-   [dsh-bypass-web-token] activation skipped: webServer.host — trustLoopback requires a loopback listener (got <host>) (plugin inactive; dsh keeps stock auth)
-   ```
+Activation never throws: every failed preflight check logs one line and leaves the plugin inactive, so the loader never records a failed entry and dsh keeps running.
 
-   插件安静返回，loader 不会记录失败条目，**dsh 完全不受影响**，仍以官方 token 鉴权提供服务——不会产生匿名入口，也不会匿名暴露到网络。
-6. **卸载可逆。** 安装时记录 `hadOwn = Object.hasOwn(conn, 'admit')` 和 `originalOwn = conn.admit`（不做 `bind` 副本），wrapper 里用 `originalOwn.call(conn, request)`。`ctx.effect` 的清理逻辑：`hadOwn` 为真时把 `originalOwn` 原样写回（`conn.admit === originalOwn`），否则 `delete conn.admit`，恢复原型方法。
-7. **HMR / 重复 apply 幂等。** 用 `Symbol.for(...)` 在实例上打标记 + 引用计数，重复安装只加计数，不会套娃。
-8. **Peer 生命周期。** WebSocket 关闭时 `admitConnection` 会 `peers.delete` 并 dispose 该 Peer；下一次请求发现记录不存在就重新 `publishPeer('answer')`，避免第二次升级拿到旧 id 变回 401。
-
-## 验证了什么 / 没验证什么
-
-已验证：
-
-- `/api` 前缀的 HTTP 准入（`connection.admit`）；
-- `/api/remote.mux` 的 WebSocket upgrade 准入（`connection.admitConnection` → `this.admit`）；
-- 对照组在两条传输上都是 401；
-- 插件日志、进程退出与端口释放、`~/.dsh` 未被修改；
-- 非 loopback（LAN IP）启动：日志出现 `activation skipped: webServer.host`，dsh 照常运行，无 token 请求仍为 401。
-
-未验证：
-
-- 没有做 `session/list` 之类的 RPC 业务级调用，只到传输层；
-- 没有验证匿名 Peer 在 gateway waterfall（`interactions: answer`）里的实际应答行为，只验证了 101 握手与 404 放行；
-- 没有做并发/压力、TLS、反向代理场景；
-- **这不是生产方案**，只是一个可行性验证。
-
-## 安全边界
-
-- 仅 loopback：`webServer.host` 非 loopback 时插件跳过激活并打印 console 错误，dsh 以原有 token 鉴权继续运行，不会有匿名入口。
-- 匿名 Peer 的 principal 是 `{ kind: 'owner' }`，**等于本机全权**：任何能访问该 loopback 端口的本机进程，都可以读写全部会话、调用全部 RPC。
-- 只应在一次性验证环境或完全可信的单机开发环境使用。
-
-## 升级风险
-
-插件依赖 `HostConnectionService` 的四个内部符号：`admit`、`isTrusted`、`publishPeer(interactions)`、`peers`。
-
-**启动期：任何一项缺失或类型不符，插件都不激活、不抛错，只打印一行 `activation skipped` 日志，dsh 继续以原有 token 鉴权运行。**
-
-| 场景 | 日志关键字 | 行为 |
+| Situation | Log stage | Result |
 | --- | --- | --- |
-| `trustLoopback: false` | 无 | 静默，不安装 |
-| `ctx.get('webServer')` 抛错 | `activation skipped: ctx.get('webServer')` | 插件不生效 |
-| `webServer` 服务缺失 | `activation skipped: webServer` | 插件不生效 |
-| `webServer.host` 缺失/非字符串 | `activation skipped: webServer.host`（带实际类型与值） | 插件不生效 |
-| `webServer.host` 非 loopback | `activation skipped: webServer.host`（带 host） | 插件不生效，保持官方鉴权 |
-| `ctx.get('connection')` 抛错 | `activation skipped: ctx.get('connection')` | 插件不生效 |
-| `connection` 服务缺失 | `activation skipped: connection` | 插件不生效 |
-| `connection.admit` 缺失/非函数 | `activation skipped: connection.admit` | 插件不生效 |
-| `connection.isTrusted` 缺失/非函数 | `activation skipped: connection.isTrusted` | 插件不生效 |
-| `connection.publishPeer` 缺失/非函数 | `activation skipped: connection.publishPeer` | 插件不生效 |
-| `connection.peers` 非 `Map` | `activation skipped: connection.peers` | 插件不生效 |
-| `ctx.effect` 缺失/抛错 | `activation skipped: ctx.effect` | 插件不生效；已安装的补丁会回滚 |
-| `connection` 实例 frozen/只读，写入 `admit` 失败 | `activation skipped: install` | 回滚，插件不生效 |
+| `trustLoopback: false` | — | Silent, nothing installed |
+| `ctx.get('webServer')` throws | `ctx.get('webServer')` | Plugin inactive |
+| `webServer` service missing | `webServer` | Plugin inactive |
+| `webServer.host` missing / not a string | `webServer.host` | Plugin inactive |
+| Listener is not loopback | `webServer.host` | Plugin inactive, stock auth kept |
+| `ctx.get('connection')` throws / missing | `connection` | Plugin inactive |
+| `connection.admit` missing / not a function | `connection.admit` | Plugin inactive |
+| `connection.isTrusted` missing | `connection.isTrusted` | Plugin inactive |
+| `connection.publishPeer` missing | `connection.publishPeer` | Plugin inactive |
+| `connection.peers` is not a `Map` | `connection.peers` | Plugin inactive |
+| `ctx.effect` missing / throws | `ctx.effect` | Plugin inactive, partial patch rolled back |
+| Instance frozen / `admit` read-only | `install` | Rolled back, plugin inactive |
 
-所有跳过日志都以 `(plugin inactive; dsh keeps stock auth)` 结尾，统一前缀 `[dsh-bypass-web-token]`。成功日志只在补丁**真正落地**后打印（`installAnonymousAdmitResult(...).installed === true`）：安装被 skip 时只有那一行 skip，不会出现「skip + success」矛盾；被拒绝的安装也不会向 fiber 注册 disposer。日志写入统一经过 try/catch 包装，`console` sink 自身抛错既不影响 `apply`，也不影响请求路径。
+All skip lines end with `(plugin inactive; dsh keeps stock auth)` and share the prefix `[dsh-bypass-web-token]`. The success line is printed only when the patch really landed (`installed === true`), so a refused install can never produce a contradictory "skip + success" pair.
 
-**运行期：wrapper 自身也绝不抛错。** 原 `admit`、`isTrusted`、`publishPeer`、`peers.get`、peer record 结构任一异常都会被吞掉，返回 `{ rejection: 401 }`（fail-closed），同一错误签名只打印一次：
+At request time the wrapper is also non-throwing. A failing original `admit`, `isTrusted`, `publishPeer`, `peers.get`, or a malformed peer record degrades to `{ rejection: 401 }` — never a `500` — and each distinct error signature is logged once:
 
-```
-[dsh-bypass-web-token] request path degraded: <stage> — <error message> (returning 401)
-```
-
-请求不会变成 500，dsh 主进程不受影响。仅在 `admit` 的签名/调用方式变化且不抛错时无法自动识别（JavaScript 无运行期类型信息），此时需要人工排查升级兼容性；即便如此也不会放开鉴权。
-
-> Cordis 4.0.5 的 `inject` 只支持必选服务列表（没有 `required`/`optional` 分离），因此 `webServer` 仍声明为必选。若整个 `webServer` 服务消失，fiber 不会激活（dsh 不受影响），但不会产生上面的跳过日志——这是 Cordis 依赖注入机制决定的，不是插件遗漏。
-
-## 文件
-
-```
-package.json            # dsh-bypass-web-token，type: module
-tsconfig.json           # 构建配置（src -> dist）
-tsconfig.test.json      # 测试/typecheck 配置（含 tests）
-src/index.ts            # name / inject / Config / apply
-src/admit.ts            # installAnonymousAdmitResult(conn, opts) -> { dispose, installed, stage? }（installAnonymousAdmit 为兼容包装）
-src/guard.ts            # isLoopbackHost
-tests/guard.spec.ts     # loopback 判定表驱动测试
-tests/admit.spec.ts     # 准入、幂等、卸载、apply 守卫、失败隔离
-scripts/setup-profile.mjs
-scripts/verify.mjs
+```text
+[dsh-bypass-web-token] request path degraded: <stage> — <message> (returning 401)
 ```
 
-`dist/`、`node_modules/`、`.dsh-home/` 均已 gitignore。
+Logging itself is best-effort: `console` calls are wrapped in `try/catch`, so a hostile or broken log sink cannot break `apply` or the request path.
+
+## Security model
+
+- **Trust boundary:** loopback interface + `Host`/`Origin` fence (`isTrusted`). Nothing else.
+- **Granted principal:** `{ kind: 'owner' }` — equivalent to the local user. Any local process that can open a connection to the port gets the same power as the person who started dsh.
+- **Not granted:** remote network access. Non-loopback listeners refuse activation; wildcard binds (`0.0.0.0`, `::`) are explicitly rejected by the loopback predicate.
+- **Still protected:** cross-origin browser requests and DNS-rebinding attempts fail the `isTrusted` check and receive `403`.
+- **Not covered:** TLS termination, reverse proxies, port forwarding, container-to-host mappings. If any of those put this port on a shared surface, the security model no longer holds.
+
+## Compatibility and upgrade risk
+
+The plugin depends on four internal members of `HostConnectionService`: `admit`, `isTrusted`, `publishPeer(interactions)`, and `peers`. They are present in `0.2.1-rc.2`, but they are not part of a stability contract.
+
+- A renamed, removed, or non-function member is detected by the preflight probe: the plugin logs which member failed and stays inert.
+- A change in `admit`'s signature or calling convention **cannot** be detected at install time (JavaScript carries no runtime types). The first request then throws inside the wrapper and is degraded to `401`; authentication is never opened by accident, but an upgrade may need manual review if anonymous access silently stops working.
+- `inject` in Cordis 4.0.5 only supports a flat required-service list, so `webServer` is declared as required. If that whole service disappears, the fiber never activates and no skip line is printed — that is dependency injection, not a plugin bug.
+
+## Development
+
+```bash
+pnpm typecheck   # src + tests
+pnpm test        # vitest, 78 tests
+pnpm build       # tsc -> dist
+pnpm setup       # rebuild the isolated profiles
+pnpm verify      # end-to-end status-code assertions
+```
+
+```text
+package.json                 package metadata, ESM entry, dist-only publish
+src/index.ts                 name / inject / Config / apply
+src/admit.ts                 installAnonymousAdmitResult(conn) -> { dispose, installed, stage? }
+                             installAnonymousAdmit(conn) -> dispose (compatibility wrapper)
+src/guard.ts                 strict loopback predicate
+tests/guard.spec.ts          loopback classification matrix
+tests/admit.spec.ts          admission, idempotency, disposal, apply guards, failure isolation
+scripts/setup-profile.mjs    build the anon / anon-off profile pair under .dsh-home
+scripts/verify.mjs           boot both profiles, assert HTTP and WS status codes
+```
+
+`dist/`, `node_modules/`, and `.dsh-home/` are git-ignored.
+
+## Limitations
+
+- This is a **local development convenience**, not a production authentication scheme.
+- Verification covers the transport layer: HTTP admission, WebSocket upgrade, disposal, and the failure matrix. It does not exercise RPC-level session behaviour, concurrency, TLS, or reverse proxies.
+- The anonymous peer is shared by all admitted requests, so per-client identity and per-client isolation do not exist by design.
+
+## License
+
+[MIT](./LICENSE) © 2026 Casper-Mars
+
+---
+
+## 中文简介
+
+`dsh-bypass-web-token` 是一个 Cordis 插件：在不修改官方包、不 fork、不用 patch-package 的前提下，运行时替换 `dsh` 实例上的 `connection.admit`，让**仅限 loopback** 的无 token 请求被接纳为一个匿名 owner peer。
+
+- 默认关闭（`trustLoopback: false`），开启后也只在本机回环监听时生效；非 loopback 监听会拒绝激活，dsh 继续使用官方 token 鉴权。
+- 保留 Host/Origin 围栏，跨源与 DNS rebinding 请求仍返回 403。
+- 激活失败、运行期异常、日志 sink 异常都不会让 dsh 崩溃，一律 fail-closed 退化为 401。
+- 匿名 peer 是 `owner` 权限，等同于本机全权，只应在可信单机或一次性测试环境中使用。

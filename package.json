@@ -1,8 +1,23 @@
 {
   "name": "dsh-bypass-web-token",
-  "version": "0.0.0",
-  "private": true,
-  "description": "PoC: replace connection.admit at runtime so loopback requests are admitted as an anonymous owner peer",
+  "version": "0.1.0",
+  "description": "Cordis plugin for dsh: admit unauthenticated loopback requests as an anonymous owner peer",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Casper-Mars/dsh-bypass-web-token.git"
+  },
+  "homepage": "https://github.com/Casper-Mars/dsh-bypass-web-token#readme",
+  "bugs": {
+    "url": "https://github.com/Casper-Mars/dsh-bypass-web-token/issues"
+  },
+  "keywords": [
+    "dsh",
+    "cordis",
+    "plugin",
+    "loopback",
+    "developer-tools"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -13,6 +28,9 @@
   ],
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
