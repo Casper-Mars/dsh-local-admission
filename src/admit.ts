@@ -123,6 +123,58 @@ export function describeError(error: unknown): string {
   }
 }
 
+/**
+ * Write a diagnostic without ever letting the log sink break the caller.
+ *
+ * A host can replace `console` with a proxy that throws, and a test can install
+ * a throwing stub. Diagnostics are best-effort: an admission decision must
+ * never depend on the logger succeeding.
+ */
+export function safeError(message: string): void {
+  try {
+    console.error(message)
+  } catch {
+    // Logging is not part of the contract; swallow sink failures.
+  }
+}
+
+/** Counterpart of {@link safeError} for the single success line. */
+export function safeInfo(message: string): void {
+  try {
+    console.info(message)
+  } catch {
+    // Same as above.
+  }
+}
+
+/**
+ * Read the peer out of a registry record without trusting the record's shape.
+ *
+ * Every property read happens here so a hostile getter (`record.peer`,
+ * `peer.id`) throws inside the caller's `try` instead of escaping to dsh.
+ *
+ * @param record - value returned by `peers.get(...)`.
+ * @returns the peer when the record is structurally usable.
+ * @throws TypeError describing the first malformed member.
+ */
+function readPeerRecord(record: unknown): PeerLike {
+  if (record === null || typeof record !== 'object') {
+    throw new TypeError(`published peer record is ${describeValue(record)}`)
+  }
+
+  const peer = (record as { peer?: unknown }).peer
+  if (peer === null || typeof peer !== 'object') {
+    throw new TypeError(`record.peer is ${describeValue(peer)}`)
+  }
+
+  const id = (peer as { id?: unknown }).id
+  if (typeof id !== 'string') {
+    throw new TypeError(`record.peer.id is ${describeValue(id)}`)
+  }
+
+  return peer as PeerLike
+}
+
 /** Type/value description used in preflight log details. */
 function describeValue(value: unknown): string {
   if (value === null) return 'null'
@@ -214,6 +266,21 @@ function inspectConnection(connection: unknown): ConnectionProbe {
 }
 
 /**
+ * Outcome of one install attempt.
+ *
+ * `stage` is only present when `installed` is false, so a caller can report
+ * exactly what blocked activation. The disposer is always safe to call.
+ */
+export interface InstallResult {
+  /** Idempotent disposer; a no-op when nothing was installed. */
+  dispose: () => void
+  /** Whether the admission override is active for this connection. */
+  installed: boolean
+  /** Preflight/install stage that prevented activation. */
+  stage?: string
+}
+
+/**
  * Install the anonymous admission override exactly once per connection
  * instance. Repeated installs only bump a reference count, so an HMR reload or
  * a second apply cannot wrap the wrapper.
@@ -221,6 +288,9 @@ function inspectConnection(connection: unknown): ConnectionProbe {
  * This function never throws. When the preflight fails or the property cannot
  * be written (frozen/read-only instance), it logs one `activation skipped`
  * line and returns a no-op disposer, leaving the stock admission intact.
+ *
+ * Compatibility wrapper around {@link installAnonymousAdmitResult}; callers
+ * that need to know whether the patch really landed must use the latter.
  *
  * @param connection - live `ctx.get('connection')` service instance.
  * @param options - optional diagnostics sink (retained for compatibility).
@@ -230,12 +300,36 @@ export function installAnonymousAdmit(
   connection: PatchableConnection,
   options: InstallOptions = {},
 ): () => void {
+  return installAnonymousAdmitResult(connection, options).dispose
+}
+
+/**
+ * Same as {@link installAnonymousAdmit}, but reports whether the patch was
+ * actually installed so `apply` can avoid logging a success that never
+ * happened.
+ *
+ * Never throws.
+ *
+ * @param connection - live `ctx.get('connection')` service instance.
+ * @param options - optional diagnostics sink (retained for compatibility).
+ * @returns `{ dispose, installed, stage? }` describing the real outcome.
+ */
+export function installAnonymousAdmitResult(
+  connection: PatchableConnection,
+  options: InstallOptions = {},
+): InstallResult {
   void options
+
+  const failed = (stage: string): InstallResult => ({
+    dispose: noop,
+    installed: false,
+    stage,
+  })
 
   const probe = probeConnection(connection)
   if (!probe.ok) {
-    console.error(activationSkipped(probe.stage, probe.detail))
-    return noop
+    safeError(activationSkipped(probe.stage, probe.detail))
+    return failed(probe.stage)
   }
   const patched = probe.connection
 
@@ -249,7 +343,7 @@ export function installAnonymousAdmit(
   }
   if (existing !== undefined) {
     existing.refs += 1
-    return makeDisposer(patched, existing)
+    return { dispose: makeDisposer(patched, existing), installed: true }
   }
 
   let hadOwn: boolean
@@ -261,13 +355,13 @@ export function installAnonymousAdmit(
     // original own property; calling with `patched` covers inherited methods.
     originalOwn = patched.admit as AdmitMethod
   } catch (error) {
-    console.error(
+    safeError(
       activationSkipped(
         'connection.admit',
         `could not read connection.admit: ${describeError(error)}`,
       ),
     )
-    return noop
+    return failed('connection.admit')
   }
 
   const state: PatchState = {
@@ -284,7 +378,7 @@ export function installAnonymousAdmit(
     const key = `${stage}:${detail}`
     if (state.lastErrorKey !== key) {
       state.lastErrorKey = key
-      console.error(requestDegraded(stage, detail))
+      safeError(requestDegraded(stage, detail))
     }
     return { rejection: 401 }
   }
@@ -353,22 +447,14 @@ export function installAnonymousAdmit(
       }
     }
 
-    if (record === undefined || typeof record !== 'object') {
-      return degrade(
-        'peer record',
-        new TypeError(`published peer record is ${describeValue(record)}`),
-      )
+    // The record lookup, the null check, and both property reads run inside one
+    // guard: `typeof null === 'object'` and hostile getters must degrade to 401
+    // instead of throwing into dsh's request handler.
+    try {
+      return { peer: readPeerRecord(record) }
+    } catch (error) {
+      return degrade('peer record', error)
     }
-
-    const peer = record.peer
-    if (peer === null || typeof peer !== 'object' || typeof peer.id !== 'string') {
-      return degrade(
-        'peer record',
-        new TypeError(`record.peer is ${describeValue(peer)}`),
-      )
-    }
-
-    return { peer }
   }
 
   try {
@@ -388,16 +474,16 @@ export function installAnonymousAdmit(
     } catch {
       // Same as above.
     }
-    console.error(
+    safeError(
       activationSkipped(
         'install',
         `cannot patch connection.admit (frozen or read-only instance): ${describeError(error)}`,
       ),
     )
-    return noop
+    return failed('install')
   }
 
-  return makeDisposer(patched, state)
+  return { dispose: makeDisposer(patched, state), installed: true }
 }
 
 /** Build one idempotent, never-throwing disposer for a shared patch state. */
@@ -418,14 +504,14 @@ function makeDisposer(
       try {
         delete marked[STATE]
       } catch (error) {
-        console.error(`${LOG_PREFIX} dispose degraded: state marker — ${describeError(error)}`)
+        safeError(`${LOG_PREFIX} dispose degraded: state marker — ${describeError(error)}`)
       }
 
       try {
         if (state.hadOwn) connection.admit = state.originalOwn
         else delete (connection as { admit?: unknown }).admit
       } catch (error) {
-        console.error(`${LOG_PREFIX} dispose degraded: connection.admit — ${describeError(error)}`)
+        safeError(`${LOG_PREFIX} dispose degraded: connection.admit — ${describeError(error)}`)
       }
 
       const peerId = state.peerId
@@ -465,7 +551,7 @@ function makeDisposer(
         // Nothing left to release.
       }
     } catch (error) {
-      console.error(`${LOG_PREFIX} dispose degraded: ${describeError(error)}`)
+      safeError(`${LOG_PREFIX} dispose degraded: ${describeError(error)}`)
     }
   }
 }

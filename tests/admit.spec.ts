@@ -2,6 +2,7 @@ import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 import { afterEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import {
   installAnonymousAdmit,
+  installAnonymousAdmitResult,
   type Admission,
   type PatchableConnection,
   type PeerLike,
@@ -62,11 +63,9 @@ class FakeContext {
   effect(setup: () => unknown): () => void {
     if (this.effectThrowsBeforeSetup) throw new Error('effect unavailable at runtime')
     const dispose = setup()
-    if (this.effectThrowsAfterSetup) {
-      this.cleanups.push(dispose as () => unknown)
-      throw new Error('effect exploded after setup')
-    }
-    this.cleanups.push(dispose as () => unknown)
+    // Mirror Cordis: only a returned function is registered as a disposer.
+    if (typeof dispose === 'function') this.cleanups.push(dispose as () => unknown)
+    if (this.effectThrowsAfterSetup) throw new Error('effect exploded after setup')
     return () => {}
   }
 }
@@ -295,6 +294,39 @@ describe('installAnonymousAdmit', () => {
       dispose()
     }).not.toThrow()
     expectActivationSkipped('connection.publishPeer')
+  })
+
+  it('reports installation status and keeps the legacy disposer contract', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+
+    const result = installAnonymousAdmitResult(connection)
+    expect(result.installed).toBe(true)
+    expect(result.stage).toBeUndefined()
+    expect('peer' in connection.admit(request)).toBe(true)
+
+    const legacy = installAnonymousAdmit(connection)
+    expect(typeof legacy).toBe('function')
+    legacy()
+    result.dispose()
+
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+  })
+
+  it('reports a refused install on a frozen instance and never claims success', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.freeze(connection)
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(false)
+    expect(result.stage).toBe('install')
+    expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
+    expect(() => result.dispose()).not.toThrow()
+    expectActivationSkipped('install')
+    expect(infoSpy).not.toHaveBeenCalled()
   })
 
   it('swallows sync throws and async rejections from peer.dispose', async () => {
@@ -576,7 +608,12 @@ describe('plugin module', () => {
     expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
 
     expectActivationSkipped('install')
+    // A refused install must stay the only line in the log: no success info.
+    expect(infoSpy).not.toHaveBeenCalled()
+    expect(errorMessages()).toHaveLength(1)
     expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
+    // No disposer registered, because nothing was installed.
+    expect(ctx.cleanups).toHaveLength(0)
     expect(connection.admit(request)).toEqual({ rejection: 401 })
     expect(connection.published).toHaveLength(0)
   })
@@ -757,6 +794,65 @@ describe('runtime wrapper defence', () => {
     dispose()
   })
 
+  it('returns 401 when peers.get yields null instead of a record', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    vi.spyOn(connection.peers, 'get').mockReturnValue(null as unknown as PeerRecord)
+    const dispose = installed(connection)
+
+    expect(() => connection.admit(request)).not.toThrow()
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(
+      errorMessages().some((m) => m.includes('request path degraded: peer record —')),
+    ).toBe(true)
+
+    dispose()
+  })
+
+  it('returns 401 when the record.peer getter throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    vi.spyOn(connection.peers, 'get').mockReturnValue({
+      get peer(): PeerLike {
+        throw new Error('peer getter exploded')
+      },
+    } as unknown as PeerRecord)
+    const dispose = installed(connection)
+
+    expect(() => connection.admit(request)).not.toThrow()
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    const messages = errorMessages()
+    expect(messages.some((m) => m.includes('request path degraded: peer record —'))).toBe(
+      true,
+    )
+    expect(messages.join('\n')).toContain('peer getter exploded')
+
+    dispose()
+  })
+
+  it('returns 401 when the peer.id getter throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    vi.spyOn(connection.peers, 'get').mockReturnValue({
+      peer: {
+        get id(): string {
+          throw new Error('id getter exploded')
+        },
+      },
+    } as unknown as PeerRecord)
+    const dispose = installed(connection)
+
+    expect(() => connection.admit(request)).not.toThrow()
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    const messages = errorMessages()
+    expect(messages.some((m) => m.includes('request path degraded: peer record —'))).toBe(
+      true,
+    )
+    expect(messages.join('\n')).toContain('id getter exploded')
+
+    dispose()
+  })
+
   it('returns 401 when the original admit returns a malformed result', () => {
     captureConsole()
     const connection = new FakeConnection()
@@ -771,5 +867,53 @@ describe('runtime wrapper defence', () => {
     ).toBe(true)
 
     dispose()
+  })
+})
+
+describe('log sink safety', () => {
+  it('keeps apply from throwing when console.error throws on a failure path', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('log sink exploded')
+    })
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    const connection = new FakeConnection()
+    Object.freeze(connection)
+    const ctx = new FakeContext({ connection, webServer: loopback })
+
+    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(Object.getOwnPropertySymbols(connection)).toHaveLength(0)
+    expect(ctx.cleanups).toHaveLength(0)
+  })
+
+  it('keeps the wrapper from throwing when console.error throws at request time', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('log sink exploded')
+    })
+
+    const connection = new FakeConnection()
+    connection.admit = () => {
+      throw new Error('stock admit exploded')
+    }
+    const dispose = installAnonymousAdmit(connection)
+
+    expect(() => connection.admit(request)).not.toThrow()
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(() => dispose()).not.toThrow()
+  })
+
+  it('keeps the patch active when console.info throws after a successful install', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {
+      throw new Error('log sink exploded')
+    })
+
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection, webServer: loopback })
+
+    expect(() => apply(ctx as never, { trustLoopback: true })).not.toThrow()
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect('peer' in connection.admit(request)).toBe(true)
+    expect(errorSpy).not.toHaveBeenCalled()
   })
 })

@@ -18,13 +18,21 @@ import {
   LOG_PREFIX,
   activationSkipped,
   describeError,
-  installAnonymousAdmit,
+  installAnonymousAdmitResult,
   probeConnection,
+  safeError,
+  safeInfo,
 } from './admit.js'
 import { isLoopbackHost } from './guard.js'
 
-export { installAnonymousAdmit } from './admit.js'
-export type { Admission, InstallOptions, PatchableConnection, PeerLike } from './admit.js'
+export { installAnonymousAdmit, installAnonymousAdmitResult } from './admit.js'
+export type {
+  Admission,
+  InstallOptions,
+  InstallResult,
+  PatchableConnection,
+  PeerLike,
+} from './admit.js'
 export { isLoopbackHost } from './guard.js'
 
 /** Stable Cordis plugin name. */
@@ -77,7 +85,7 @@ export function apply(ctx: Context, config: Config): void {
     activate(ctx, config)
   } catch (error) {
     // Last-resort guard: no plugin failure may reach the dsh loader.
-    console.error(activationSkipped('unexpected', describeError(error)))
+    safeError(activationSkipped('unexpected', describeError(error)))
   }
 }
 
@@ -85,7 +93,7 @@ function activate(ctx: Context, config: Config): void {
   if (config?.trustLoopback !== true) return
 
   const skip = (stage: string, detail: string): void => {
-    console.error(activationSkipped(stage, detail))
+    safeError(activationSkipped(stage, detail))
   }
 
   // 1. webServer lookup itself can throw on a partially initialized context.
@@ -150,13 +158,19 @@ function activate(ctx: Context, config: Config): void {
     return
   }
 
+  let installed = false
   let uninstall: (() => void) | undefined
   try {
     ;(effect as EffectMethod).call(
       ctx,
       () => {
-        uninstall = installAnonymousAdmit(probe.connection)
-        return uninstall
+        const result = installAnonymousAdmitResult(probe.connection)
+        // A refused install must not hand a disposer to the fiber, otherwise
+        // the effect lifecycle would imply a patch that never landed.
+        if (!result.installed) return
+        installed = true
+        uninstall = result.dispose
+        return result.dispose
       },
       'connection-anonymous: connection.admit override',
     )
@@ -171,16 +185,12 @@ function activate(ctx: Context, config: Config): void {
     return
   }
 
-  try {
-    console.info(
-      `${LOG_PREFIX} loopback listener ${host}: anonymous requests are admitted as an owner peer`,
-    )
-  } catch (error) {
-    try {
-      uninstall?.()
-    } catch {
-      // Ignore: nothing else can be done.
-    }
-    skip('post-install', describeError(error))
-  }
+  // Only report success when the override is really active. A refused install
+  // has already logged its own `activation skipped` line, and a "skip" line
+  // followed by a "success" line would be a lie.
+  if (!installed) return
+
+  safeInfo(
+    `${LOG_PREFIX} loopback listener ${host}: anonymous requests are admitted as an owner peer`,
+  )
 }

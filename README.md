@@ -99,7 +99,7 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 | `ctx.effect` 缺失/抛错 | `activation skipped: ctx.effect` | 插件不生效；已安装的补丁会回滚 |
 | `connection` 实例 frozen/只读，写入 `admit` 失败 | `activation skipped: install` | 回滚，插件不生效 |
 
-所有跳过日志都以 `(plugin inactive; dsh keeps stock auth)` 结尾，统一前缀 `[dsh-connection-anonymous]`。
+所有跳过日志都以 `(plugin inactive; dsh keeps stock auth)` 结尾，统一前缀 `[dsh-connection-anonymous]`。成功日志只在补丁**真正落地**后打印（`installAnonymousAdmitResult(...).installed === true`）：安装被 skip 时只有那一行 skip，不会出现「skip + success」矛盾；被拒绝的安装也不会向 fiber 注册 disposer。日志写入统一经过 try/catch 包装，`console` sink 自身抛错既不影响 `apply`，也不影响请求路径。
 
 **运行期：wrapper 自身也绝不抛错。** 原 `admit`、`isTrusted`、`publishPeer`、`peers.get`、peer record 结构任一异常都会被吞掉，返回 `{ rejection: 401 }`（fail-closed），同一错误签名只打印一次：
 
@@ -118,7 +118,7 @@ package.json            # dsh-connection-anonymous，type: module
 tsconfig.json           # 构建配置（src -> dist）
 tsconfig.test.json      # 测试/typecheck 配置（含 tests）
 src/index.ts            # name / inject / Config / apply
-src/admit.ts            # installAnonymousAdmit(conn, opts)
+src/admit.ts            # installAnonymousAdmitResult(conn, opts) -> { dispose, installed, stage? }（installAnonymousAdmit 为兼容包装）
 src/guard.ts            # isLoopbackHost
 tests/guard.spec.ts     # loopback 判定表驱动测试
 tests/admit.spec.ts     # 准入、幂等、卸载、apply 守卫、失败隔离
