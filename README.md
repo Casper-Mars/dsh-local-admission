@@ -192,6 +192,14 @@ scripts/verify.mjs           boot both profiles on loopback and LAN, assert HTTP
 - The anonymous peer is shared by all admitted requests, so per-client identity and per-client isolation do not exist by design.
 - The static web UI is fully in scope: `authorizeIndex` returns `true` and `/connect` returns an empty cookie, so the browser never needs a token.
 
+## Registry classification
+
+The package is declared as **dual-use content** — `"contentPolicy": { "class": "dual-use" }`
+in `package.json`, plus a [`DISCLOSURE`](./DISCLOSURE) file shipped in the tarball. Removing
+authentication gates is a security-relevant capability, so npm's publish-time scanning treats
+it accordingly. Releases must be published through a 2FA-enforced method (interactive publish
+or staged publishing followed by maintainer approval).
+
 ## License
 
 [MIT](./LICENSE) © 2026 Casper-Mars

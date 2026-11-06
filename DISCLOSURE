@@ -1,0 +1,67 @@
+DISCLOSURE — dsh-bypass-web-token
+=================================
+
+What this package does
+----------------------
+`dsh-bypass-web-token` is a Cordis plugin for `dsh` (DeepSeek Harness). When
+loaded into a dsh profile it overrides three methods on the live, in-process
+`HostConnectionService` instance:
+
+  * `admit`           — the gate used by `/api/*` HTTP routes and the
+                        `/api/remote.mux` WebSocket upgrade;
+  * `authorizeIndex`  — the gate that guards the web UI shell (`index.html`);
+  * `authorizeConnect`— the `/connect` launch-token exchange.
+
+With the overrides in place, requests that reach the dsh web listener are
+admitted as one shared anonymous `owner` peer, and `/connect` answers with an
+empty session cookie. Disposing the plugin restores the original methods by
+reference, so the stock token/cookie authentication returns.
+
+The package does not modify files on disk, does not fork or patch published
+packages, does not register services, cron jobs, or shell hooks, and does not
+persist anything across a dsh restart.
+
+Why this is dual-use content
+----------------------------
+Any mechanism that removes an authentication gate can be used for good or for
+harm. This package intentionally disables authentication on a developer tool's
+local web surface, which automated scanning can reasonably read as an
+authentication bypass. It is declared here so that npm can apply scanning
+suited to dual-use packages.
+
+Intended legitimate use
+-----------------------
+Local development and test automation on a machine the operator controls:
+driving the dsh web UI with a browser automation tool, calling `/api/*` from
+scripts without copying the printed `?token=` URL, and probing the WebSocket
+mux from test harnesses. Typical deployments are a single-user workstation, a
+disposable VM, a container, or a CI sandbox, bound to loopback or to a trusted
+private LAN address.
+
+Safety properties
+-----------------
+  * No install-time scripts: the package has no `preinstall`, `install`,
+    `postinstall`, or `prepare` hooks.
+  * No network activity of its own: no telemetry, no callbacks, no exfiltration.
+  * No credential access: it never reads, logs, stores, or transmits tokens,
+    cookies, API keys, or environment secrets.
+  * Reversible and idempotent: every override keeps the exact original function
+    reference and is restored on disposal; repeated installs share one patch
+    through a reference count.
+  * Fail-closed: a malformed service, a frozen instance, or any internal error
+    degrades to HTTP 401 instead of opening access.
+  * Process-local: nothing is written outside memory, so restarting dsh removes
+    the effect entirely.
+
+Explicit non-goals and warnings
+-------------------------------
+This is not an authentication scheme and must not be used in production or on
+an internet-facing listener. While active, the peer it creates holds the
+`owner` principal: any client that can reach the bound port — including other
+processes on the machine and, on a LAN bind, other hosts on that network —
+gets full read/write access to dsh sessions and RPC. The README repeats this
+warning at the top.
+
+Contact
+-------
+Casper-Mars — https://github.com/Casper-Mars/dsh-bypass-web-token/issues
