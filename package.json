@@ -1,0 +1,34 @@
+{
+  "name": "dsh-connection-anonymous",
+  "version": "0.0.0",
+  "private": true,
+  "description": "PoC: replace connection.admit at runtime so loopback requests are admitted as an anonymous owner peer",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "setup": "node scripts/setup-profile.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2",
+    "@types/node": "^26.6.6",
+    "typescript": "~5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
