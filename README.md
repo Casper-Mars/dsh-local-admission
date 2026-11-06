@@ -1,7 +1,7 @@
 # dsh-local-admission
 
 [![npm version](https://img.shields.io/npm/v/dsh-local-admission.svg)](https://www.npmjs.com/package/dsh-local-admission)
-[![license](https://img.shields.io/github/license/Casper-Mars/dsh-bypass-web-token.svg)](./LICENSE)
+[![license](https://img.shields.io/github/license/Casper-Mars/dsh-local-admission.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.2-blue.svg)](https://www.npmjs.com/package/@deepseek-ai/dsh)
 
@@ -191,14 +191,6 @@ scripts/verify.mjs           boot both profiles on loopback and LAN, assert HTTP
 - Verification covers the transport layer: HTTP admission, WebSocket upgrade, disposal, and the failure matrix. It does not exercise RPC-level session behaviour, concurrency, TLS, or reverse proxies.
 - The admitted peer is shared by all admitted requests, so per-client identity and per-client isolation do not exist by design.
 - The static web UI is fully in scope: `authorizeIndex` returns `true` and `/connect` returns an empty cookie, so the browser never needs a token.
-
-## Registry classification
-
-The package is declared as **dual-use content** — `"contentPolicy": { "class": "dual-use" }`
-in `package.json`, plus a [`DISCLOSURE`](./DISCLOSURE) file shipped in the tarball. Overriding
-authentication gates at runtime is a security-relevant capability, so npm's publish-time scanning
-treats it accordingly. Releases must be published through a 2FA-enforced method (interactive publish
-or staged publishing followed by maintainer approval).
 
 ## License
 
