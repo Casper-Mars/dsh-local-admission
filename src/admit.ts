@@ -69,6 +69,24 @@ type AdmitMethod = (
 const STATE = Symbol.for('dsh-connection-anonymous/patch-state')
 
 /**
+ * Fail closed unless the runtime still exposes `admit` as a callable method.
+ *
+ * The published type says `admit` exists, but a dsh upgrade can remove or
+ * rename this internal symbol. Detecting that at activation time keeps the
+ * failure visible to the loader instead of deferring a `TypeError` to the
+ * first request.
+ */
+export function assertAdmitMethod(
+  connection: PatchableConnection,
+): asserts connection is PatchableConnection {
+  if (typeof (connection as { admit?: unknown }).admit === 'function') return
+  const message =
+    '[dsh-connection-anonymous] refusing to activate: connection.admit is missing or not a function'
+  console.error(message)
+  throw new Error(message)
+}
+
+/**
  * Install the anonymous admission override exactly once per connection
  * instance. Repeated installs only bump a reference count, so an HMR reload or
  * a second apply cannot wrap the wrapper.
@@ -81,6 +99,8 @@ export function installAnonymousAdmit(
   connection: PatchableConnection,
   options: InstallOptions = {},
 ): () => void {
+  assertAdmitMethod(connection)
+
   const warn = options.warn ?? ((message: string) => console.warn(message))
   const marked = connection as unknown as Record<PropertyKey, unknown>
 

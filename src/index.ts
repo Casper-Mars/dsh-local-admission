@@ -9,7 +9,11 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { installAnonymousAdmit, type PatchableConnection } from './admit.js'
+import {
+  assertAdmitMethod,
+  installAnonymousAdmit,
+  type PatchableConnection,
+} from './admit.js'
 import { isLoopbackHost } from './guard.js'
 
 export { installAnonymousAdmit } from './admit.js'
@@ -70,6 +74,10 @@ export function apply(ctx: Context, config: Config): void {
   if (connection === undefined) {
     throw new Error('[dsh-connection-anonymous] connection service is unavailable')
   }
+
+  // Validate before registering the effect: a refused activation must leave no
+  // disposer, no patched instance, and no peer behind.
+  assertAdmitMethod(connection)
 
   ctx.effect(() => {
     console.info(

@@ -251,6 +251,68 @@ describe('plugin module', () => {
     error.mockRestore()
   })
 
+  it('refuses to activate when connection.admit is missing', () => {
+    const publishPeer = vi.fn(() => 'peer-1')
+    const connection = {
+      peers: new Map(),
+      isTrusted: () => true,
+      publishPeer,
+    } as unknown as PatchableConnection
+    const ctx = new FakeContext({ connection, webServer: { host: '127.0.0.1' } })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    expect(() => apply(ctx as never, { trustLoopback: true })).toThrow(
+      '[dsh-connection-anonymous] refusing to activate: connection.admit is missing or not a function',
+    )
+    expect(error).toHaveBeenCalledTimes(1)
+    expect(error).toHaveBeenCalledWith(
+      '[dsh-connection-anonymous] refusing to activate: connection.admit is missing or not a function',
+    )
+    // Nothing was patched or published, and no cleanup was registered.
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(ctx.cleanups).toHaveLength(0)
+    expect(publishPeer).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it('refuses to activate when connection.admit is not a function', () => {
+    const publishPeer = vi.fn(() => 'peer-1')
+    const connection = {
+      admit: {},
+      peers: new Map(),
+      isTrusted: () => true,
+      publishPeer,
+    } as unknown as PatchableConnection
+    const ctx = new FakeContext({ connection, webServer: { host: '127.0.0.1' } })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    expect(() => apply(ctx as never, { trustLoopback: true })).toThrow(
+      '[dsh-connection-anonymous] refusing to activate: connection.admit is missing or not a function',
+    )
+    expect(error).toHaveBeenCalledTimes(1)
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect(ctx.cleanups).toHaveLength(0)
+    expect(publishPeer).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it('still installs on a loopback listener with a valid admit', () => {
+    const connection = new FakeConnection()
+    const ctx = new FakeContext({ connection, webServer: { host: '127.0.0.1' } })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    apply(ctx as never, { trustLoopback: true })
+
+    expect(error).not.toHaveBeenCalled()
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    expect('peer' in connection.admit(request)).toBe(true)
+    expect(ctx.cleanups).toHaveLength(1)
+
+    ctx.cleanups[0]!()
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    error.mockRestore()
+  })
+
   it('installs on a loopback listener and restores on fiber disposal', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: { host: '127.0.0.1' } })
