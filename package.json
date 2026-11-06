@@ -1,6 +1,6 @@
 {
   "name": "dsh-bypass-web-token",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cordis plugin for dsh: tokenless UI, /api and WebSocket admission as an anonymous owner peer (zero-config, any bind address)",
   "license": "MIT",
   "repository": {
