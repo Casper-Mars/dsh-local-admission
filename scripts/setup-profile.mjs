@@ -29,8 +29,8 @@ const dshBin = process.env.DSH_BIN ?? 'dsh'
 /** `- insert` appends to the root entry list; the loader validates it. */
 function patchEntry(trustLoopback) {
   return `- insert:
-    - id: connection-anonymous
-      name: dsh-connection-anonymous
+    - id: bypass-web-token
+      name: dsh-bypass-web-token
       inject: ['connection', 'webServer']
       config:
         trustLoopback: ${trustLoopback ? 'true' : 'false'}
@@ -75,7 +75,7 @@ const anonOffDir = join(profilesDir, 'anon-off')
 copyProfile(template, anonDir)
 console.log(`[setup] copied ${template} -> ${anonDir}`)
 
-console.log('[setup] linking dsh-connection-anonymous into the anon profile')
+console.log('[setup] linking dsh-bypass-web-token into the anon profile')
 execFileSync(dshBin, ['plugin', '--profile', 'anon', 'add', projectRoot], {
   stdio: 'inherit',
   env: { ...process.env, DSH_HOME: dshHome },

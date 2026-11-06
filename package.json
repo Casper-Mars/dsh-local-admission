@@ -1,5 +1,5 @@
 {
-  "name": "dsh-connection-anonymous",
+  "name": "dsh-bypass-web-token",
   "version": "0.0.0",
   "private": true,
   "description": "PoC: replace connection.admit at runtime so loopback requests are admitted as an anonymous owner peer",

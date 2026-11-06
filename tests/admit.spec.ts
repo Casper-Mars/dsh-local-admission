@@ -94,7 +94,7 @@ function expectActivationSkipped(stage: string): void {
     message.includes(`activation skipped: ${stage} —`),
   )
   expect(hit).toHaveLength(1)
-  expect(hit[0]).toContain('[dsh-connection-anonymous]')
+  expect(hit[0]).toContain('[dsh-bypass-web-token]')
   expect(hit[0]).toContain('(plugin inactive; dsh keeps stock auth)')
 }
 
@@ -357,7 +357,7 @@ describe('installAnonymousAdmit', () => {
 
 describe('plugin module', () => {
   it('exports a Cordis plugin shape', () => {
-    expect(name).toBe('connection-anonymous')
+    expect(name).toBe('bypass-web-token')
     expect(inject).toEqual(['connection', 'webServer'])
     expect((Config as unknown as (value: unknown) => Config)({}).trustLoopback).toBe(
       false,

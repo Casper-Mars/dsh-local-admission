@@ -18,7 +18,7 @@
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 
 /** Stable log prefix shared with `src/index.ts`. */
-export const LOG_PREFIX = '[dsh-connection-anonymous]'
+export const LOG_PREFIX = '[dsh-bypass-web-token]'
 
 /**
  * Structural view of a Peer. `@deepseek-ai/dsh-typert-protocol` owns the real
@@ -98,7 +98,7 @@ type AdmitMethod = (
 ) => Admission
 
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
-const STATE = Symbol.for('dsh-connection-anonymous/patch-state')
+const STATE = Symbol.for('dsh-bypass-web-token/patch-state')
 
 /** Disposer returned when nothing was installed. */
 const noop = (): void => {}

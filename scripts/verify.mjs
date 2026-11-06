@@ -203,7 +203,7 @@ try {
   )
   check(anon.ws === 101, `anon: GET /api/remote.mux upgrade is 101 (got ${anon.ws})`)
   check(
-    anon.output.includes('[dsh-connection-anonymous]'),
+    anon.output.includes('[dsh-bypass-web-token]'),
     'anon: plugin logged its loopback admission notice',
   )
 } catch (error) {

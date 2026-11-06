@@ -1,4 +1,4 @@
-# dsh-connection-anonymous（PoC）
+# dsh-bypass-web-token（PoC）
 
 验证一个假设：**不改官方包、不 fork、不用 patch-package**，只靠一个 Cordis 插件，在运行时替换 `connection.admit`，让 loopback 上的内部 API 在**没有 token / cookie** 时也被接纳为一个 owner Peer。
 
@@ -46,7 +46,7 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 5. **只在 loopback 生效（fail-closed）。** `apply` 读取 `webServer.host`；非 loopback 且 `trustLoopback: true` 时插件**跳过激活**，只打印一行 console 错误：
 
    ```
-   [dsh-connection-anonymous] activation skipped: webServer.host — trustLoopback requires a loopback listener (got <host>) (plugin inactive; dsh keeps stock auth)
+   [dsh-bypass-web-token] activation skipped: webServer.host — trustLoopback requires a loopback listener (got <host>) (plugin inactive; dsh keeps stock auth)
    ```
 
    插件安静返回，loader 不会记录失败条目，**dsh 完全不受影响**，仍以官方 token 鉴权提供服务——不会产生匿名入口，也不会匿名暴露到网络。
@@ -99,12 +99,12 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 | `ctx.effect` 缺失/抛错 | `activation skipped: ctx.effect` | 插件不生效；已安装的补丁会回滚 |
 | `connection` 实例 frozen/只读，写入 `admit` 失败 | `activation skipped: install` | 回滚，插件不生效 |
 
-所有跳过日志都以 `(plugin inactive; dsh keeps stock auth)` 结尾，统一前缀 `[dsh-connection-anonymous]`。成功日志只在补丁**真正落地**后打印（`installAnonymousAdmitResult(...).installed === true`）：安装被 skip 时只有那一行 skip，不会出现「skip + success」矛盾；被拒绝的安装也不会向 fiber 注册 disposer。日志写入统一经过 try/catch 包装，`console` sink 自身抛错既不影响 `apply`，也不影响请求路径。
+所有跳过日志都以 `(plugin inactive; dsh keeps stock auth)` 结尾，统一前缀 `[dsh-bypass-web-token]`。成功日志只在补丁**真正落地**后打印（`installAnonymousAdmitResult(...).installed === true`）：安装被 skip 时只有那一行 skip，不会出现「skip + success」矛盾；被拒绝的安装也不会向 fiber 注册 disposer。日志写入统一经过 try/catch 包装，`console` sink 自身抛错既不影响 `apply`，也不影响请求路径。
 
 **运行期：wrapper 自身也绝不抛错。** 原 `admit`、`isTrusted`、`publishPeer`、`peers.get`、peer record 结构任一异常都会被吞掉，返回 `{ rejection: 401 }`（fail-closed），同一错误签名只打印一次：
 
 ```
-[dsh-connection-anonymous] request path degraded: <stage> — <error message> (returning 401)
+[dsh-bypass-web-token] request path degraded: <stage> — <error message> (returning 401)
 ```
 
 请求不会变成 500，dsh 主进程不受影响。仅在 `admit` 的签名/调用方式变化且不抛错时无法自动识别（JavaScript 无运行期类型信息），此时需要人工排查升级兼容性；即便如此也不会放开鉴权。
@@ -114,7 +114,7 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 ## 文件
 
 ```
-package.json            # dsh-connection-anonymous，type: module
+package.json            # dsh-bypass-web-token，type: module
 tsconfig.json           # 构建配置（src -> dist）
 tsconfig.test.json      # 测试/typecheck 配置（含 tests）
 src/index.ts            # name / inject / Config / apply

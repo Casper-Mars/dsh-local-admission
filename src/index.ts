@@ -1,5 +1,5 @@
 /**
- * `dsh-connection-anonymous` — PoC plugin.
+ * `dsh-bypass-web-token` — PoC plugin.
  *
  * When `trustLoopback` is enabled and the web listener binds a loopback
  * address, unauthenticated requests that pass the Host/Origin fence are
@@ -36,7 +36,7 @@ export type {
 export { isLoopbackHost } from './guard.js'
 
 /** Stable Cordis plugin name. */
-export const name = 'connection-anonymous'
+export const name = 'bypass-web-token'
 
 /**
  * Services read by the plugin.
@@ -172,7 +172,7 @@ function activate(ctx: Context, config: Config): void {
         uninstall = result.dispose
         return result.dispose
       },
-      'connection-anonymous: connection.admit override',
+      'bypass-web-token: connection.admit override',
     )
   } catch (error) {
     // If the setup already ran, undo it rather than leaving a half-active patch.
