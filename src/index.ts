@@ -46,8 +46,9 @@ interface WebServerLike {
  * @param ctx - plugin context with `connection` and `webServer` injected.
  * @param config - resolved plugin config (schema defaults applied).
  * @throws when `trustLoopback` is enabled on a non-loopback listener: an
- *   anonymous owner Peer equals full local authority, so misconfiguration must
- *   fail the boot instead of silently exposing the network.
+ *   anonymous owner Peer equals full local authority, so the plugin refuses to
+ *   activate. The Cordis loader records the failed entry and keeps dsh running
+ *   with its stock token authentication — there is no anonymous entry point.
  */
 export function apply(ctx: Context, config: Config): void {
   if (!config.trustLoopback) return
@@ -55,9 +56,12 @@ export function apply(ctx: Context, config: Config): void {
   const webServer = ctx.get('webServer') as unknown as WebServerLike | undefined
   const host = webServer?.host
   if (typeof host !== 'string' || !isLoopbackHost(host)) {
-    throw new Error(
-      `[dsh-connection-anonymous] trustLoopback requires a loopback listener, got host ${JSON.stringify(host)}`,
-    )
+    const message =
+      `[dsh-connection-anonymous] refusing to activate: trustLoopback requires a loopback listener (got ${
+        typeof host === 'string' ? host : String(host)
+      })`
+    console.error(message)
+    throw new Error(message)
   }
 
   const connection = ctx.get('connection') as unknown as

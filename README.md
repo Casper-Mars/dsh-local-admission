@@ -43,8 +43,14 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 2. **实例属性覆盖 prototype。** `requestRejection`、`admitConnection`、`/api` 路由、WebSocket upgrade 全部走 `this.admit(...)`，所以 `conn.admit = fn` 能覆盖所有入口。
 3. **匿名 Peer 必须是 `interactions: 'answer'`。** 用 `conn.publishPeer('answer')` 注册进 `conn.peers`，`{ peer: record.peer }` 才能被 `admitConnection` 接管（它要按 id 查 `peers` 才能建立 socket 所有权）。`browserPeer` 没有 answer，`$events` 会被 `gateway/interactions-forbidden` 拒绝。
 4. **Host/Origin 围栏保留。** 先执行 `conn.isTrusted(request)`，不可信一律 `{ rejection: 403 }`，不会因为开了匿名就把 CSRF/DNS-rebinding 防护一起关掉。
-5. **只在 loopback 生效。** `apply` 读取 `webServer.host`，非 loopback 且 `trustLoopback: true` 直接抛错，启动失败——宁可起不来，也不要静默把本机全权暴露到网络。
-6. **卸载可逆。** `ctx.effect` 的清理逻辑：如果 `admit` 原本是继承的（`!Object.hasOwn(conn, 'admit')`），`delete conn.admit`；否则写回原函数。
+5. **只在 loopback 生效（fail-closed）。** `apply` 读取 `webServer.host`；非 loopback 且 `trustLoopback: true` 时插件**拒绝激活**并把错误记进日志：
+
+   ```
+   [dsh-connection-anonymous] refusing to activate: trustLoopback requires a loopback listener (got <host>)
+   ```
+
+   Cordis loader 会记录 `1 entry did not activate`，**dsh 继续运行**，该实例仍以官方 token 鉴权提供服务——不会产生匿名入口，也不会匿名暴露到网络。
+6. **卸载可逆。** 安装时记录 `hadOwn = Object.hasOwn(conn, 'admit')` 和 `originalOwn = conn.admit`（不做 `bind` 副本），wrapper 里用 `originalOwn.call(conn, request)`。`ctx.effect` 的清理逻辑：`hadOwn` 为真时把 `originalOwn` 原样写回（`conn.admit === originalOwn`），否则 `delete conn.admit`，恢复原型方法。
 7. **HMR / 重复 apply 幂等。** 用 `Symbol.for(...)` 在实例上打标记 + 引用计数，重复安装只加计数，不会套娃。
 8. **Peer 生命周期。** WebSocket 关闭时 `admitConnection` 会 `peers.delete` 并 dispose 该 Peer；下一次请求发现记录不存在就重新 `publishPeer('answer')`，避免第二次升级拿到旧 id 变回 401。
 
@@ -55,7 +61,8 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 - `/api` 前缀的 HTTP 准入（`connection.admit`）；
 - `/api/remote.mux` 的 WebSocket upgrade 准入（`connection.admitConnection` → `this.admit`）；
 - 对照组在两条传输上都是 401；
-- 插件日志、进程退出与端口释放、`~/.dsh` 未被修改。
+- 插件日志、进程退出与端口释放、`~/.dsh` 未被修改；
+- 非 loopback（LAN IP）启动：日志出现 `refusing to activate`，dsh 照常运行，无 token 请求仍为 401。
 
 未验证：
 
@@ -66,7 +73,7 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 
 ## 安全边界
 
-- 仅 loopback：`webServer.host` 非 loopback 时直接启动失败。
+- 仅 loopback：`webServer.host` 非 loopback 时插件拒绝激活（日志报错），dsh 以原有 token 鉴权继续运行，不会有匿名入口。
 - 匿名 Peer 的 principal 是 `{ kind: 'owner' }`，**等于本机全权**：任何能访问该 loopback 端口的本机进程，都可以读写全部会话、调用全部 RPC。
 - 只应在一次性验证环境或完全可信的单机开发环境使用。
 
@@ -81,9 +88,9 @@ pnpm verify    # 真启动两次 dsh，断言状态码
 dsh 升级后如果重命名、改成 `#private` 字段或改变 `admit` 的调用方式，插件会：
 
 - `publishPeer`/`peers` 缺失 → 打 warn 并退化为原始 401（fail closed）；
-- `admit` 缺失或签名变化 → 安装时抛错，启动失败。
+- `admit` 缺失或签名变化 → 插件拒绝激活并记录错误，dsh 继续以原有 token 鉴权运行。
 
-两种情况都不会静默放开鉴权。
+两种情况都不会静默放开鉴权（fail-closed）。
 
 ## 文件
 

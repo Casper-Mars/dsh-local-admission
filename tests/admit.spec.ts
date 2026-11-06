@@ -150,18 +150,32 @@ describe('installAnonymousAdmit', () => {
     expect(connection.admit(request)).toEqual({ rejection: 401 })
   })
 
-  it('restores a pre-existing own `admit` when one was already installed', () => {
+  it('restores the exact same function when `admit` was an own property', () => {
     const connection = new FakeConnection()
-    const previous = (): Admission => ({ rejection: 401 })
-    connection.admit = previous
+    const originalOwn = (): Admission => ({ rejection: 401 })
+    connection.admit = originalOwn
 
     const dispose = installAnonymousAdmit(connection)
-    expect(connection.admit).not.toBe(previous)
+    expect(connection.admit).not.toBe(originalOwn)
     expect('peer' in connection.admit(request)).toBe(true)
 
     dispose()
     expect(Object.hasOwn(connection, 'admit')).toBe(true)
+    // Identity must survive: a bound copy would fail this comparison.
+    expect(connection.admit).toBe(originalOwn)
     expect(connection.admit(request)).toEqual({ rejection: 401 })
+  })
+
+  it('leaves no own `admit` behind when the original was inherited', () => {
+    const connection = new FakeConnection()
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+
+    const dispose = installAnonymousAdmit(connection)
+    expect(Object.hasOwn(connection, 'admit')).toBe(true)
+
+    dispose()
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(connection.admit).toBe(FakeConnection.prototype.admit)
   })
 
   it('disposes the anonymous peer on final uninstall', async () => {
@@ -209,23 +223,32 @@ describe('plugin module', () => {
     expect(connection.admit(request)).toEqual({ rejection: 401 })
   })
 
-  it('fails the boot when trustLoopback meets a non-loopback listener', () => {
+  it('refuses to activate when trustLoopback meets a non-loopback listener', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: { host: '192.168.1.10' } })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     expect(() => apply(ctx as never, { trustLoopback: true })).toThrow(
-      /requires a loopback listener/,
+      /refusing to activate: trustLoopback requires a loopback listener \(got 192\.168\.1\.10\)/,
     )
+    expect(error).toHaveBeenCalledWith(
+      '[dsh-connection-anonymous] refusing to activate: trustLoopback requires a loopback listener (got 192.168.1.10)',
+    )
+    // Nothing was patched, so the stock token gate keeps answering 401.
     expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    error.mockRestore()
   })
 
-  it('fails the boot when the listener host is missing', () => {
+  it('refuses to activate when the listener host is missing', () => {
     const connection = new FakeConnection()
     const ctx = new FakeContext({ connection, webServer: {} })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     expect(() => apply(ctx as never, { trustLoopback: true })).toThrow(
-      /requires a loopback listener/,
+      /refusing to activate: trustLoopback requires a loopback listener \(got undefined\)/,
     )
+    error.mockRestore()
   })
 
   it('installs on a loopback listener and restores on fiber disposal', () => {

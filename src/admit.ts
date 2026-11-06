@@ -54,9 +54,16 @@ interface PatchState {
   refs: number
   /** Whether `admit` was already an own property, i.e. someone else patched it. */
   hadOwn: boolean
-  original: (request: ConnectionTrustRequest) => Admission
+  /** The method exactly as found at install time (own function or prototype). */
+  originalOwn: AdmitMethod
   peerId: string | undefined
 }
+
+/** `admit` with its receiver typed, so the wrapper can `call` the original. */
+type AdmitMethod = (
+  this: PatchableConnection,
+  request: ConnectionTrustRequest,
+) => Admission
 
 /** Marks the patched instance; `Symbol.for` keeps HMR-created module copies in sync. */
 const STATE = Symbol.for('dsh-connection-anonymous/patch-state')
@@ -84,9 +91,10 @@ export function installAnonymousAdmit(
   }
 
   const hadOwn = Object.hasOwn(connection, 'admit')
-  const original = connection.admit.bind(connection) as (
-    request: ConnectionTrustRequest,
-  ) => Admission
+  // Keep the exact function that was there. `bind` would produce a copy, and
+  // writing that copy back on uninstall would break identity with the original
+  // own property; calling with `connection` covers inherited methods too.
+  const originalOwn = connection.admit as AdmitMethod
   const canPublish =
     typeof connection.publishPeer === 'function' && connection.peers instanceof Map
   if (!canPublish) {
@@ -95,10 +103,10 @@ export function installAnonymousAdmit(
     )
   }
 
-  const state: PatchState = { refs: 1, hadOwn, original, peerId: undefined }
+  const state: PatchState = { refs: 1, hadOwn, originalOwn, peerId: undefined }
 
   const admit = (request: ConnectionTrustRequest): Admission => {
-    const admission = original(request)
+    const admission = originalOwn.call(connection, request)
     // 1. Missing internals: keep the stock 401 rather than widening the fence.
     if (!canPublish) return admission
     // 2. A real browser/API credential always wins; never downgrade it.
@@ -146,7 +154,7 @@ function makeDisposer(
     const marked = connection as unknown as Record<PropertyKey, unknown>
     delete marked[STATE]
 
-    if (state.hadOwn) connection.admit = state.original
+    if (state.hadOwn) connection.admit = state.originalOwn
     else delete (connection as { admit?: unknown }).admit
 
     const record =
