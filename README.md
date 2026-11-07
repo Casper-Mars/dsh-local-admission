@@ -51,17 +51,17 @@ The stock cookie/token flow is replaced rather than forged: `authorizeIndex` is 
 flowchart LR
   C[HTTP request / WS upgrade] --> D{host disposing?}
   D -- yes --> R401[401 rejection]
-  D -- no --> K{peer already<br/>published?}
-  K -- no --> N[publishPeer answer]
+  D -- no --> K{shared peer<br/>already minted?}
   K -- yes --> U[reuse]
-  N --> OK[shared owner peer]
+  K -- no --> N["createPeer(owner, answer)<br/>(fallback: publishPeer + peers.delete)"]
+  N --> OK[unregistered shared owner peer]
   U --> OK
 ```
 
 1. **Patch the instance, not the class.** A plugin installed into a dsh profile can resolve a *different* module instance than the one dsh booted, so prototype patches fail silently. The plugin takes the service from `ctx.get('connection')` and defines own properties that shadow the prototype methods.
 2. **`admit` is replaced, not wrapped.** The stock `admit` is never called: no credential lookup, no `isTrusted`, no `Host`/`Origin` comparison, no 403 branch. A disposing host still answers `401`; everything else is admitted. This is a deliberate full local-trust model for an operator-controlled machine, not an authentication extension.
-3. **One shared `interactions: 'answer'` peer.** `publishPeer('answer')` registers the peer in the service's `peers` map. `admitConnection` looks peers up by id to take socket ownership, so an `answer` peer is required; a browser peer would be rejected by `gateway/interactions-forbidden`.
-4. **Peer lifecycle mirrors the socket.** When a WebSocket closes, dsh deletes the peer record. The wrapper notices the missing record on the next request and publishes a fresh peer instead of reusing a dead id — otherwise the second upgrade would fall back to `401`.
+3. **One shared `interactions: 'answer'` peer that is deliberately NOT in `peers`.** `admit` mints it once through `connection.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' })` — the same shape as the stock `browserPeer` — or, on a build without `createPeer`, through `publishPeer('answer')` followed by `peers.delete(id)`. Keeping it out of the registry is what makes multi-tab and reconnect work: `admitConnection` grants *exclusive* socket ownership (`record.ownsSocket = true`) only to registered peers, so a registered peer answers `409 Conflict` to every second `/api/remote.mux` upgrade until the first socket closes. An unregistered peer takes `admitConnection`'s early `release: () => Promise.resolve()` branch, exactly like `browserPeer`, and any number of tabs/clients can share it. `interactions: 'answer'` itself is required: a `none` peer is rejected with `gateway/interactions-forbidden` when the client opens its `$events` stream.
+4. **Peer lifetime is the process, not the socket.** Sockets never own or dispose the shared peer, so closing a tab, reloading, or racing a reconnect cannot invalidate it. The plugin disposes it when it is uninstalled; if the `peers` registry cannot remove the fallback peer, admission degrades to `401` instead of silently serialising sockets.
 5. **`authorizeConnect` no longer exchanges a launch token.** It keeps the official query parsing (`interactions` must be declared at most once, as `answer` or `none`; otherwise `400`), publishes the peer through the supplied `publish` callback (or `publishPeer` when dsh calls the instance method with two arguments), and answers `302` to `./api/remote.mux` with an empty `dsh-session` cookie. No secret is read, nothing is signed, and non-`GET` / non-`/connect` requests return `false` to the caller.
 6. **`authorizeIndex` answers `true` for every request.** No token, no cookie, no redirect; `BrowserAuth.authenticate` is never consulted for the index route.
 7. **Reversible and idempotent.** The exact original function references are kept (no `bind` copy). Disposal writes them back, or deletes the own property when the method was inherited. Repeated installs share one patch through a `Symbol.for(...)` marker plus a reference count, so HMR reloads and duplicate `apply` calls cannot wrap the wrapper. If any of the three writes fails, all three are rolled back.
@@ -154,7 +154,7 @@ Logging itself is best-effort: every `console` call (`error`, `info`, `warn`) is
 
 ## Compatibility and upgrade risk
 
-The plugin depends on three internal members of `HostConnectionService`: `admit`, `publishPeer(interactions)`, and `peers`. It additionally overrides `authorizeIndex` and `authorizeConnect` when present. `isTrusted` is no longer read at all. None of these are part of a stability contract.
+The plugin depends on two internal members of `HostConnectionService`: `admit` and `publishPeer(interactions)`, plus the `peers` map (used as the fallback when `createPeer` is absent). `createPeer(options)`, `authorizeIndex`, and `authorizeConnect` are used when present and degraded gracefully when not. `isTrusted` is no longer read at all. None of these are part of a stability contract.
 
 - A renamed, removed, or non-function required member is detected by the preflight probe: the plugin logs which member failed and stays inert.
 - A missing `authorizeIndex` or `authorizeConnect` only produces a warning; the remaining gates stay active.

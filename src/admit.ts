@@ -89,6 +89,15 @@ export interface PatchableConnection {
    * calls it, and a missing implementation does not block activation.
    */
   isTrusted?(request: ConnectionTrustRequest): boolean
+  /**
+   * Create an unregistered Peer owned by the service. Optional only because a
+   * dsh build may rename it; when absent the patch falls back to
+   * {@link PatchableConnection.publishPeer}.
+   */
+  createPeer?(options: {
+    principal?: { kind: 'owner' }
+    interactions?: ConnectionInteractions
+  }): PeerLike
   publishPeer(interactions?: ConnectionInteractions): string
   peers: Map<string, PeerRecord>
   readonly disposed?: boolean
@@ -136,7 +145,12 @@ interface PatchState {
   readonly admit: MethodPatch<AdmitMethod>
   readonly index: MethodPatch<AuthorizeIndexMethod>
   readonly connect: MethodPatch<AuthorizeConnectMethod>
-  peerId: string | undefined
+  /**
+   * Long-lived owner Peer shared by every admitted request, mirroring the
+   * stock `browserPeer`. Deliberately absent from `peers`, so
+   * `admitConnection` never claims socket ownership for it.
+   */
+  sharedPeer: PeerLike | undefined
   /** Last runtime error signature, used to throttle repeated request logs. */
   lastErrorKey: string | undefined
 }
@@ -273,6 +287,18 @@ function readPeerRecord(record: unknown): PeerLike {
     throw new TypeError(`record.peer.id is ${describeValue(id)}`)
   }
 
+  return peer as PeerLike
+}
+
+/** Read a Peer returned by `createPeer` without trusting its shape. */
+function readPeerLike(peer: unknown): PeerLike {
+  if (peer === null || typeof peer !== 'object') {
+    throw new TypeError(`createPeer returned ${describeValue(peer)}`)
+  }
+  const id = (peer as { id?: unknown }).id
+  if (typeof id !== 'string' || id === '') {
+    throw new TypeError(`createPeer peer.id is ${describeValue(id)}`)
+  }
   return peer as PeerLike
 }
 
@@ -507,7 +533,7 @@ export function installAnonymousAdmitResult(
       hadOwn: hadOwnConnect,
       original: connectMethod,
     },
-    peerId: undefined,
+    sharedPeer: undefined,
     lastErrorKey: undefined,
   }
 
@@ -525,8 +551,18 @@ export function installAnonymousAdmitResult(
   /**
    * The entire admission decision. No stock call, no Host/Origin check.
    *
-   * Order is fixed: a disposing host refuses; a cached peer record is reused
-   * while it exists; otherwise a fresh `answer` peer is published and returned.
+   * Order is fixed: a disposing host refuses; once minted, the one shared owner
+   * Peer answers every request, exactly like the stock `browserPeer`.
+   *
+   * The Peer is deliberately **not** registered in `peers`. `admitConnection`
+   * treats a registered Peer as an exclusive socket owner (`ownsSocket`): the
+   * first `/api/remote.mux` upgrade claims it and every other upgrade — a
+   * second tab, a second client, or a reconnect racing the old socket — is
+   * answered `409 Conflict` until that socket closes. The browser Client then
+   * loops on "connection lost", the generation never reaches `ready`, and the
+   * session list stays empty. An unregistered Peer makes `admitConnection`
+   * return a no-op release for every socket, which is how stock dsh serves any
+   * number of browser tabs from one `browserPeer`.
    */
   const admit = (_request: ConnectionTrustRequest): Admission => {
     // 1. A disposing host must not mint new Peers.
@@ -538,44 +574,89 @@ export function installAnonymousAdmitResult(
     }
     if (disposed) return { rejection: 401 }
 
-    // 2. `admitConnection` looks the peer up by id and deletes it on socket
-    //    close, so a released peer must be republished instead of reused.
-    let record: PeerRecord | undefined
-    try {
-      record = state.peerId === undefined ? undefined : patched.peers.get(state.peerId)
-    } catch (error) {
-      return degrade('peers.get', error)
-    }
+    // 2. One long-lived owner Peer for the whole process.
+    const shared = state.sharedPeer
+    if (shared !== undefined) return { peer: shared }
 
-    if (record === undefined) {
-      let peerId: string
+    // 2a. Preferred: mint an unregistered Peer exactly the way the stock
+    //     `browserPeer` is built (`createPeer` is a public service method).
+    let createPeer: unknown
+    try {
+      createPeer = (patched as { createPeer?: unknown }).createPeer
+    } catch (error) {
+      return degrade('createPeer', error)
+    }
+    if (typeof createPeer === 'function') {
+      let created: unknown
       try {
-        peerId = patched.publishPeer.call(patched, 'answer')
+        created = (createPeer as (options: unknown) => unknown).call(patched, {
+          principal: { kind: 'owner' },
+          interactions: 'answer',
+        })
       } catch (error) {
-        return degrade('publishPeer', error)
+        return degrade('createPeer', error)
       }
-      if (typeof peerId !== 'string' || peerId === '') {
+      if (created === null || typeof created !== 'object') {
         return degrade(
-          'publishPeer',
-          new TypeError(`publishPeer returned ${describeValue(peerId)} instead of an id`),
+          'createPeer',
+          new TypeError(`createPeer returned ${describeValue(created)}`),
         )
       }
-      state.peerId = peerId
       try {
-        record = patched.peers.get(peerId)
+        const candidate = readPeerLike(created)
+        state.sharedPeer = candidate
+        return { peer: candidate }
       } catch (error) {
-        return degrade('peers.get', error)
+        return degrade('createPeer', error)
       }
+    }
+
+    // 2b. Fallback for a dsh build without `createPeer`: publish through the
+    //     stock registry, then immediately unregister the Peer. The instance
+    //     keeps owning it (we dispose it on uninstall), while `admitConnection`
+    //     sees no record and therefore never claims socket ownership — the same
+    //     shape as `browserPeer`.
+    let peerId: string
+    try {
+      peerId = patched.publishPeer.call(patched, 'answer')
+    } catch (error) {
+      return degrade('publishPeer', error)
+    }
+    if (typeof peerId !== 'string' || peerId === '') {
+      return degrade(
+        'publishPeer',
+        new TypeError(`publishPeer returned ${describeValue(peerId)} instead of an id`),
+      )
+    }
+
+    let record: PeerRecord | undefined
+    try {
+      record = patched.peers.get(peerId)
+    } catch (error) {
+      return degrade('peers.get', error)
     }
 
     // The record lookup, the null check, and both property reads run inside one
     // guard: `typeof null === 'object'` and throwing getters must degrade to 401
     // instead of throwing into dsh's request handler.
+    let peer: PeerLike
     try {
-      return { peer: readPeerRecord(record) }
+      peer = readPeerRecord(record)
     } catch (error) {
       return degrade('peer record', error)
     }
+
+    try {
+      patched.peers.delete(peerId)
+    } catch (error) {
+      // A registry that cannot be unregistered still admits this peer, but
+      // `ownsSocket` would then serialise sockets. Treat it as fatal so the
+      // caller gets a clear 401 instead of a UI that silently never connects.
+      return degrade('peers.delete', error)
+    }
+
+    state.sharedPeer = peer
+    return { peer }
   }
 
   /** Best-effort `writeHead` + `end` that never escapes the wrapper. */
@@ -743,42 +824,21 @@ function makeDisposer(
       rollbackMethod(connection, 'authorizeIndex', state.index)
       rollbackMethod(connection, 'authorizeConnect', state.connect)
 
-      const peerId = state.peerId
-      state.peerId = undefined
-      if (peerId === undefined) return
-
-      let record: PeerRecord | undefined
-      try {
-        record = connection.peers.get(peerId)
-      } catch {
-        return
-      }
-      if (record === undefined) return
-
-      try {
-        connection.peers.delete(peerId)
-      } catch {
-        // A closed registry needs no cleanup.
-      }
-
-      try {
-        const peer = record.peer
-        const disposePeer = peer?.dispose
-        if (typeof disposePeer === 'function') {
-          const result = disposePeer.call(peer)
-          // Both a synchronous throw (caught above) and an async rejection
-          // must stay silent: the peer may already be gone at shutdown.
-          if (
-            result !== null &&
-            typeof result === 'object' &&
-            typeof (result as PromiseLike<void>).then === 'function'
-          ) {
+      const shared = state.sharedPeer
+      state.sharedPeer = undefined
+      if (shared !== undefined) {
+        try {
+          const result = shared.dispose?.()
+          if (result !== null && typeof result === 'object') {
             ;(result as PromiseLike<void>).then(undefined, () => {})
           }
+        } catch {
+          // The service may already be torn down.
         }
-      } catch {
-        // Nothing left to release.
       }
+
+      // The shared Peer is unregistered by design (see `admit`), so it is
+      // released here instead of by `admitConnection` on socket close.
     } catch (error) {
       safeError(`${LOG_PREFIX} dispose degraded: ${describeError(error)}`)
     }

@@ -32,6 +32,13 @@ class FakeConnection implements PatchableConnection {
   readonly indexCalls: Array<{ request: unknown; response: unknown }> = []
   /** Every call the plugin let through to the stock /connect gate. */
   readonly connectCalls: Array<{ request: unknown; response: unknown }> = []
+  /** Set by a test to exercise the preferred `createPeer` path. */
+  declare createPeer?: (options: {
+    principal?: { kind: 'owner' }
+    interactions?: 'answer' | 'none'
+  }) => PeerLike
+  /** Peers minted through `createPeer` (which are never registered in `peers`). */
+  readonly created: PeerLike[] = []
   private seq = 0
 
   /** Stock `BrowserAuth.authorizeIndex`: refuses without a token or cookie. */
@@ -231,7 +238,7 @@ describe('installAnonymousAdmit', () => {
     dispose()
   })
 
-  it('reuses one peer across requests but republishes after a socket release', () => {
+  it('reuses one peer across requests and leaves it out of the socket registry', () => {
     captureConsole()
     const connection = new FakeConnection()
     const dispose = installAnonymousAdmit(connection)
@@ -239,16 +246,91 @@ describe('installAnonymousAdmit', () => {
     const first = connection.admit(request)
     const second = connection.admit(request)
     if (!('peer' in first) || !('peer' in second)) throw new Error('expected peers')
-    expect(second.peer.id).toBe(first.peer.id)
+    expect(second.peer).toBe(first.peer)
+    // One publish for the whole process, and the registry is empty again:
+    // `admitConnection` must not treat this Peer as an exclusive socket owner.
+    expect(connection.published).toEqual([{ id: 'peer-1', interactions: 'answer' }])
+    expect(connection.peers.size).toBe(0)
+
+    dispose()
+  })
+
+  it('regression: concurrent upgrades are all admitted (never 409 like a registered peer)', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const dispose = installAnonymousAdmit(connection)
+
+    // Port of the stock `HostConnectionService.admitConnection` bookkeeping:
+    // a registered Peer is claimed exclusively and answers 409 to a second
+    // upgrade; a `browserPeer`-shaped (unregistered) Peer never does. The bug
+    // this guards against produced exactly "connection lost" in a second tab.
+    const upgrade = (): { peer: PeerLike } | { rejection: number } => {
+      const admission = connection.admit(request)
+      if ('rejection' in admission) return admission
+      const record = connection.peers.get(admission.peer.id)
+      if (record === undefined) return { peer: admission.peer }
+      if (record.ownsSocket === true) return { rejection: 409 }
+      record.ownsSocket = true
+      return { peer: record.peer }
+    }
+
+    const firstTab = upgrade()
+    const secondTab = upgrade()
+    const reconnect = upgrade()
+
+    expect('peer' in firstTab).toBe(true)
+    expect('peer' in secondTab).toBe(true)
+    expect('peer' in reconnect).toBe(true)
+    expect(secondTab).toEqual(firstTab)
     expect(connection.published).toHaveLength(1)
 
-    // `admitConnection` deletes the record when the WebSocket closes.
-    connection.peers.delete(first.peer.id)
+    dispose()
+  })
 
-    const third = connection.admit(request)
-    if (!('peer' in third)) throw new Error('expected a peer')
-    expect(third.peer.id).not.toBe(first.peer.id)
-    expect(connection.published).toHaveLength(2)
+  it('prefers connection.createPeer and never publishes into the registry', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    connection.createPeer = (options) => {
+      const peer: PeerLike = {
+        id: 'created-peer',
+        ...(options?.interactions === undefined
+          ? {}
+          : { interactions: options.interactions }),
+        dispose: vi.fn(async () => {}),
+      }
+      connection.created.push(peer)
+      return peer
+    }
+    const dispose = installAnonymousAdmit(connection)
+
+    const first = connection.admit(request)
+    const second = connection.admit(request)
+    if (!('peer' in first) || !('peer' in second)) throw new Error('expected peers')
+    expect(first.peer.id).toBe('created-peer')
+    expect(first.peer.interactions).toBe('answer')
+    expect(second.peer).toBe(first.peer)
+    expect(connection.created).toHaveLength(1)
+    expect(connection.published).toHaveLength(0)
+    expect(connection.peers.size).toBe(0)
+
+    dispose()
+    const created = connection.created[0]
+    if (created?.dispose === undefined) throw new Error('expected a dispose handle')
+    expect(created.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('returns 401 once when createPeer throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    connection.createPeer = () => {
+      throw new Error('createPeer exploded')
+    }
+    const dispose = installAnonymousAdmit(connection)
+
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    // The failure is logged once per distinct signature, not per request.
+    expect(errorMessages().filter((line) => line.includes('createPeer'))).toHaveLength(1)
 
     dispose()
   })
