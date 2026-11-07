@@ -53,16 +53,16 @@ flowchart LR
   D -- yes --> R401[401 rejection]
   D -- no --> K{shared peer<br/>already minted?}
   K -- yes --> U[reuse]
-  K -- no --> N["createPeer(owner, answer)<br/>(fallback: publishPeer + peers.delete)"]
+  K -- no --> N["createPeer(owner, answer)<br/>(on error/unusable: dispose +<br/>fallback publishPeer + peers.delete)"]
   N --> OK[unregistered shared owner peer]
   U --> OK
 ```
 
 1. **Patch the instance, not the class.** A plugin installed into a dsh profile can resolve a *different* module instance than the one dsh booted, so prototype patches fail silently. The plugin takes the service from `ctx.get('connection')` and defines own properties that shadow the prototype methods.
 2. **`admit` is replaced, not wrapped.** The stock `admit` is never called: no credential lookup, no `isTrusted`, no `Host`/`Origin` comparison, no 403 branch. A disposing host still answers `401`; everything else is admitted. This is a deliberate full local-trust model for an operator-controlled machine, not an authentication extension.
-3. **One shared `interactions: 'answer'` peer that is deliberately NOT in `peers`.** `admit` mints it once through `connection.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' })` — the same shape as the stock `browserPeer` — or, on a build without `createPeer`, through `publishPeer('answer')` followed by `peers.delete(id)`. Keeping it out of the registry is what makes multi-tab and reconnect work: `admitConnection` grants *exclusive* socket ownership (`record.ownsSocket = true`) only to registered peers, so a registered peer answers `409 Conflict` to every second `/api/remote.mux` upgrade until the first socket closes. An unregistered peer takes `admitConnection`'s early `release: () => Promise.resolve()` branch, exactly like `browserPeer`, and any number of tabs/clients can share it. `interactions: 'answer'` itself is required: a `none` peer is rejected with `gateway/interactions-forbidden` when the client opens its `$events` stream.
-4. **Peer lifetime is the process, not the socket.** Sockets never own or dispose the shared peer, so closing a tab, reloading, or racing a reconnect cannot invalidate it. The plugin disposes it when it is uninstalled; if the `peers` registry cannot remove the fallback peer, admission degrades to `401` instead of silently serialising sockets.
-5. **`authorizeConnect` no longer exchanges a launch token.** It keeps the official query parsing (`interactions` must be declared at most once, as `answer` or `none`; otherwise `400`), publishes the peer through the supplied `publish` callback (or `publishPeer` when dsh calls the instance method with two arguments), and answers `302` to `./api/remote.mux` with an empty `dsh-session` cookie. No secret is read, nothing is signed, and non-`GET` / non-`/connect` requests return `false` to the caller.
+3. **One shared `interactions: 'answer'` peer that is deliberately NOT in `peers`.** `admit` mints it once through `connection.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' })` — the same shape as the stock `browserPeer` — or, on a build without `createPeer`, through `publishPeer('answer')` followed by `peers.delete(id)`. Keeping it out of the registry is what makes multi-tab and reconnect work: `admitConnection` grants *exclusive* socket ownership (`record.ownsSocket = true`) only to registered peers, so a registered peer answers `409 Conflict` to every second `/api/remote.mux` upgrade until the first socket closes. An unregistered peer takes `admitConnection`'s early `release: () => Promise.resolve()` branch, exactly like `browserPeer`, and any number of tabs/clients can share it. `interactions: 'answer'` itself is required: a `none` peer is rejected with `gateway/interactions-forbidden` when the client opens its `$events` stream. Because "unregistered" is the whole invariant, the plugin does not trust `createPeer` to honour it: a minted peer found in `peers` is removed (and re-checked) before it is handed out. If that removal fails, the peer is disposed and the request is refused rather than returning a peer that would serialise sockets.
+4. **Peer lifetime is the process, not the socket.** Sockets never own or dispose the shared peer, so closing a tab, reloading, or racing a reconnect cannot invalidate it. The plugin disposes it when it is uninstalled. In the fallback path, a `peers.delete` that throws (or silently leaves the record in place) disposes the just-published peer and degrades the request to `401`; the plugin never keeps a registered peer as its shared owner.
+5. **`authorizeConnect` no longer exchanges a launch token.** It keeps the official query parsing (`interactions` must be declared at most once, as `answer` or `none`; otherwise `400`), publishes the peer through the supplied `publish` callback (or `publishPeer` when dsh calls the instance method with two arguments; a `createPeer`-only build skips publication because the mux mints its own peer), and answers `302` to `./api/remote.mux` with an empty `dsh-session` cookie. No secret is read, nothing is signed, and non-`GET` / non-`/connect` requests return `false` to the caller.
 6. **`authorizeIndex` answers `true` for every request.** No token, no cookie, no redirect; `BrowserAuth.authenticate` is never consulted for the index route.
 7. **Reversible and idempotent.** The exact original function references are kept (no `bind` copy). Disposal writes them back, or deletes the own property when the method was inherited. Repeated installs share one patch through a `Symbol.for(...)` marker plus a reference count, so HMR reloads and duplicate `apply` calls cannot wrap the wrapper. If any of the three writes fails, all three are rolled back.
 8. **The bind address is only a log detail.** `webServer` is looked up optionally and `webServer.host` is read for wording (loopback → info, otherwise → warning). A missing service, a throwing lookup, or a missing/non-string/throwing `host` cannot block activation; the line then says `unknown`.
@@ -124,8 +124,10 @@ Activation never throws: every failed preflight check logs one line and leaves t
 | `ctx.get('connection')` throws / service missing | `connection` | Plugin inactive |
 | `connection.admit` missing / not a function | `connection.admit` | Plugin inactive |
 | `connection.isTrusted` missing | — | **Still active**: the override never calls it |
-| `connection.publishPeer` missing | `connection.publishPeer` | Plugin inactive |
-| `connection.peers` is not a `Map` | `connection.peers` | Plugin inactive |
+| `connection.publishPeer` **and** `connection.createPeer` missing | `connection.publishPeer` | Plugin inactive (no way to mint a peer) |
+| `connection.publishPeer` missing, `createPeer` present | — | **Still active**: every peer is minted through `createPeer` |
+| `connection.peers` is not a `Map` **and** `createPeer` missing | `connection.peers` | Plugin inactive (the fallback cannot unregister its peer) |
+| `connection.peers` is not a `Map`, `createPeer` present | — | **Still active**: no registry exists that could claim socket ownership |
 | `ctx.effect` missing / throws | `ctx.effect` | Plugin inactive, partial patch rolled back |
 | Instance frozen / any of the three gates read-only | `install` | All three gates rolled back, plugin inactive |
 | `webServer` missing, lookup throws, `host` unreadable | — | **Still active**, log says `unknown` |
@@ -134,7 +136,7 @@ Activation never throws: every failed preflight check logs one line and leaves t
 
 All skip lines end with `(plugin inactive; dsh keeps stock auth)` and share the prefix `[dsh-local-admission]`. The success line is printed only when the patch really landed (`installed === true`), so a refused install can never produce a contradictory "skip + success" pair.
 
-At request time the wrapper is also non-throwing. A failing `publishPeer`, `peers.get`, a throwing `disposed` getter, or a malformed peer record degrades to `{ rejection: 401 }` — never a `500` — and each distinct error signature is logged once. An internal failure inside `authorizeConnect` degrades to `401` the same way; the stock implementation is never called as a fallback.
+At request time the wrapper is also non-throwing. An unusable `createPeer` (throws, returns a non-object, or returns a peer without a usable non-empty `id`) is released best-effort and the **same request** falls back to `publishPeer` + `peers.delete`; only if that also fails does the request degrade to `{ rejection: 401 }`. A failing `publishPeer`, `peers.get`, `peers.delete`, a throwing `disposed` getter, or a malformed peer record degrades to `401` — never a `500`. Each distinct error signature is logged once (the fallback line reads `createPeer path unusable: … (falling back to publishPeer)`; refusals read `request path degraded: … (returning 401)`). An internal failure inside `authorizeConnect` degrades to `401` the same way; the stock implementation is never called as a fallback.
 
 ```text
 [dsh-local-admission] request path degraded: <stage> — <message> (returning 401)
@@ -154,9 +156,26 @@ Logging itself is best-effort: every `console` call (`error`, `info`, `warn`) is
 
 ## Compatibility and upgrade risk
 
-The plugin depends on two internal members of `HostConnectionService`: `admit` and `publishPeer(interactions)`, plus the `peers` map (used as the fallback when `createPeer` is absent). `createPeer(options)`, `authorizeIndex`, and `authorizeConnect` are used when present and degraded gracefully when not. `isTrusted` is no longer read at all. None of these are part of a stability contract.
+The plugin needs `admit` plus **one** peer-minting capability. None of these members are part of a stability contract.
 
-- A renamed, removed, or non-function required member is detected by the preflight probe: the plugin logs which member failed and stays inert.
+| Member | Role | When missing |
+| --- | --- | --- |
+| `admit(request)` | the gate that is replaced | **Required**; plugin inactive (`connection.admit`) |
+| `createPeer({ principal, interactions })` | preferred minting path; expected to return an **unregistered** peer | fall back to `publishPeer` + `peers.delete` |
+| `publishPeer(interactions)` + `peers` `Map` | fallback minting path (publish, then unregister) | plugin inactive if `createPeer` is also missing (`connection.publishPeer` / `connection.peers`) |
+| `authorizeIndex(request, response)` | UI shell gate | warning; `/api`, `/connect`, WebSocket stay active |
+| `authorizeConnect(request, response, …)` | `/connect` gate | warning; `/api`, WebSocket, UI stay active |
+| `isTrusted(request)` | never read | no effect |
+
+Priority and fallback, precisely:
+
+1. `createPeer` is tried first on the first admission.
+2. If it is absent, throws, or returns something unusable (non-object, missing/empty `id`), the result is disposed best-effort, one `createPeer path unusable` line is logged, and the same request retries through `publishPeer('answer')` + `peers.delete(id)`.
+3. Only when both paths fail (or `peers.delete` cannot uphold the unregistered invariant) does admission return `401`.
+4. A `createPeer` that registers its result is handled defensively: the plugin deletes it from `peers`, verifies the record is gone, and only then caches it. A failed delete/verification disposes the peer and refuses the request. This keeps the multi-tab/reconnect fix intact on builds whose `createPeer` differs from the tested one.
+5. A `createPeer`-only build activates normally: `/connect` simply skips its registry publication (the mux mints through `createPeer` anyway), and the registry defence is skipped because there is no registry to consult.
+
+- A renamed, removed, or non-function required member is detected by the preflight probe: the plugin logs which member failed and stays inert. "Required" means `admit` plus at least one minting path (`createPeer`, or `publishPeer` with a `peers` Map).
 - A missing `authorizeIndex` or `authorizeConnect` only produces a warning; the remaining gates stay active.
 - A change in `admit`'s signature or calling convention **cannot** be detected at install time (JavaScript carries no runtime types). The first request then degrades to `401`; authentication is never opened by accident, but an upgrade may need manual review if local admission silently stops working.
 - `inject` only declares `connection`. `webServer` is read with `ctx.get('webServer')` purely for log wording, so a dsh build without that service still activates, logging `unknown`.
@@ -165,7 +184,7 @@ The plugin depends on two internal members of `HostConnectionService`: `admit` a
 
 ```bash
 pnpm typecheck   # src + tests
-pnpm test        # vitest, 90 tests
+pnpm test        # vitest, 103 tests
 pnpm build       # tsc -> dist
 pnpm setup       # rebuild the isolated profiles (anon / anon-off)
 pnpm verify      # end-to-end status-code assertions
@@ -204,6 +223,7 @@ scripts/verify.mjs           boot both profiles on loopback and LAN, assert HTTP
 
 - **零配置：装上插件即生效，卸载插件即恢复**。没有任何配置项，`cordis.patch.yml` 里只有 `id` / `name` / `inject`。
 - **本地准入策略**：`admit` 直接签发共享的 `answer` peer，不调用官方实现，也不做 Host/Origin 校验；官方 token、cookie、`isTrusted` 均不再参与。
+- **peer 铸造有两条路径**：优先 `createPeer(owner, answer)`；若它缺失、抛错或返回非法对象，先 best-effort dispose，再在同一请求内回退 `publishPeer('answer') + peers.delete(id)`，两条都失败才 401。若未来某构建的 `createPeer` 会把 peer 注册进 `peers`，插件会先删除并复核，删除失败则 dispose 并拒绝，绝不返回已注册 peer（否则多标签页/重连会回到 409）。只提供 `createPeer` 的构建同样可以激活。
 - **全链路免 token**：`/`（UI 外壳）、`/api/*`、`/connect`、`/api/remote.mux` WebSocket 一视同仁。`/connect?...` 返回 `302` 并附带一个**空值** `dsh-session` cookie，不读取也不签发任何凭据。
 - 安装后不再对监听地址追加限制，Loopback、LAN IP 一视同仁；监听地址只影响日志措辞：回环地址打一条 info；非回环地址先打一条 WARNING（提示「能访问该端口的客户端将被视为 owner 主体」）再打一条 info。
 - `0.0.0.0` / `::` 由 dsh 自身在 CLI 与 schema 层拒绝，请显式绑定具体 IPv4/IPv6 地址（如 `192.168.1.92`）。

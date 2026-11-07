@@ -319,7 +319,7 @@ describe('installAnonymousAdmit', () => {
     expect(created.dispose).toHaveBeenCalledOnce()
   })
 
-  it('returns 401 once when createPeer throws', () => {
+  it('falls back to publishPeer when createPeer throws, logging it once', () => {
     captureConsole()
     const connection = new FakeConnection()
     connection.createPeer = () => {
@@ -327,10 +327,49 @@ describe('installAnonymousAdmit', () => {
     }
     const dispose = installAnonymousAdmit(connection)
 
+    const first = connection.admit(request)
+    const second = connection.admit(request)
+    if (!('peer' in first) || !('peer' in second)) throw new Error('expected peers')
+    // The same request falls through to the registry path instead of turning
+    // every admission into a 401 for the life of the process.
+    expect(first.peer.id).toBe('peer-1')
+    expect(first.peer.interactions).toBe('answer')
+    expect(second.peer).toBe(first.peer)
+    expect(connection.published).toEqual([{ id: 'peer-1', interactions: 'answer' }])
+    expect(connection.peers.size).toBe(0)
+
+    const fallbackLines = errorMessages().filter((line) =>
+      line.includes('createPeer path unusable'),
+    )
+    expect(fallbackLines).toHaveLength(1)
+    expect(fallbackLines[0]).toContain('createPeer exploded')
+    expect(fallbackLines[0]).toContain('(falling back to publishPeer)')
+    // The request was admitted, so no "returning 401" line may be logged.
+    expect(errorMessages().some((line) => line.includes('returning 401'))).toBe(false)
+
+    dispose()
+  })
+
+  it('returns 401 once when both createPeer and publishPeer fail', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    connection.createPeer = () => {
+      throw new Error('createPeer exploded')
+    }
+    connection.publishPeer = () => {
+      throw new Error('publish exploded')
+    }
+    const dispose = installAnonymousAdmit(connection)
+
+    expect(() => connection.admit(request)).not.toThrow()
     expect(connection.admit(request)).toEqual({ rejection: 401 })
-    expect(connection.admit(request)).toEqual({ rejection: 401 })
-    // The failure is logged once per distinct signature, not per request.
-    expect(errorMessages().filter((line) => line.includes('createPeer'))).toHaveLength(1)
+    // Two distinct signatures, each reported exactly once across both requests.
+    expect(
+      errorMessages().filter((line) => line.includes('createPeer path unusable')),
+    ).toHaveLength(1)
+    expect(
+      errorMessages().filter((line) => line.includes('request path degraded: publishPeer —')),
+    ).toHaveLength(1)
 
     dispose()
   })
@@ -794,6 +833,263 @@ describe('installAnonymousAdmit', () => {
   })
 })
 
+describe('peer minting resilience', () => {
+  /** Port of `admitConnection`'s exclusivity bookkeeping, used as the oracle. */
+  function upgrade(
+    connection: FakeConnection,
+  ): { peer: PeerLike } | { rejection: number } {
+    const admission = connection.admit(request)
+    if ('rejection' in admission) return admission
+    const record = connection.peers.get(admission.peer.id)
+    if (record === undefined) return { peer: admission.peer }
+    if (record.ownsSocket === true) return { rejection: 409 }
+    record.ownsSocket = true
+    return { peer: record.peer }
+  }
+
+  it('unregisters a createPeer result that a future build registers (never 409)', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const peer: PeerLike = {
+      id: 'registered-peer',
+      interactions: 'answer',
+      dispose: vi.fn(async () => {}),
+    }
+    connection.createPeer = () => {
+      connection.created.push(peer)
+      // Simulates the risk the P2 report describes: createPeer both mints and
+      // registers, which is what the stock browserPeer path must never do.
+      connection.peers.set(peer.id, { peer, ownsSocket: false })
+      return peer
+    }
+    const dispose = installAnonymousAdmit(connection)
+
+    const firstTab = upgrade(connection)
+    const reconnect = upgrade(connection)
+    const thirdTab = upgrade(connection)
+
+    expect('peer' in firstTab).toBe(true)
+    expect('peer' in reconnect).toBe(true)
+    expect('peer' in thirdTab).toBe(true)
+    expect(reconnect).toEqual(firstTab)
+    expect(thirdTab).toEqual(firstTab)
+    expect(connection.peers.size).toBe(0)
+    expect(connection.published).toHaveLength(0)
+    expect(errorMessages()).toHaveLength(0)
+
+    dispose()
+  })
+
+  it('releases the minted peer and returns 401 when unregistering it throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const disposePeer = vi.fn(async () => {})
+    connection.createPeer = () => {
+      const peer: PeerLike = {
+        id: 'registered-peer',
+        interactions: 'answer',
+        dispose: disposePeer,
+      }
+      connection.created.push(peer)
+      connection.peers.set(peer.id, { peer, ownsSocket: false })
+      return peer
+    }
+    vi.spyOn(connection.peers, 'delete').mockImplementation(() => {
+      throw new Error('registry is read-only')
+    })
+    const dispose = installAnonymousAdmit(connection)
+
+    let admission: Admission | undefined
+    expect(() => {
+      admission = connection.admit(request)
+    }).not.toThrow()
+    // Never hand out a peer that the registry would claim exclusively.
+    expect(admission).toEqual({ rejection: 401 })
+    expect(disposePeer).toHaveBeenCalledOnce()
+    const lines = errorMessages()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('request path degraded: peers.delete —')
+    expect(lines[0]).toContain('registry is read-only')
+
+    // A repeat is still non-throwing and still throttled to one log line.
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(errorMessages()).toHaveLength(1)
+
+    dispose()
+  })
+
+  it('releases the published peer and returns 401 when peers.delete throws', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    vi.spyOn(connection.peers, 'delete').mockImplementation(() => {
+      throw new Error('registry is read-only')
+    })
+    const dispose = installAnonymousAdmit(connection)
+
+    let admission: Admission | undefined
+    expect(() => {
+      admission = connection.admit(request)
+    }).not.toThrow()
+    expect(admission).toEqual({ rejection: 401 })
+    const published = connection.peers.get('peer-1')
+    if (published?.peer.dispose === undefined) throw new Error('expected a published peer')
+    // The Peer is no longer usable (a registered peer would serialise sockets),
+    // so it must not be left behind for a later request to reuse.
+    expect(published.peer.dispose).toHaveBeenCalledOnce()
+
+    const lines = errorMessages()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('request path degraded: peers.delete —')
+    expect(lines[0]).toContain('(returning 401)')
+
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    expect(errorMessages()).toHaveLength(1)
+
+    dispose()
+  })
+
+  it('releases an unusable createPeer result before falling back', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    const disposePeer = vi.fn(async () => {})
+    connection.createPeer = () => ({
+      id: '',
+      interactions: 'answer',
+      dispose: disposePeer,
+    })
+    const dispose = installAnonymousAdmit(connection)
+
+    const admission = connection.admit(request)
+    if (!('peer' in admission)) throw new Error('expected a peer')
+    expect(admission.peer.id).toBe('peer-1')
+    expect(disposePeer).toHaveBeenCalledOnce()
+    expect(connection.published).toHaveLength(1)
+    expect(connection.peers.size).toBe(0)
+
+    const lines = errorMessages()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('createPeer peer.id is ""')
+    expect(lines[0]).toContain('(falling back to publishPeer)')
+
+    dispose()
+  })
+
+  it('falls back when createPeer returns a non-peer, swallowing a throwing dispose', () => {
+    const cases: Array<{ created: unknown; detail: string }> = [
+      { created: null, detail: 'createPeer returned null' },
+      { created: 42, detail: 'createPeer returned 42' },
+    ]
+
+    for (const testCase of cases) {
+      captureConsole()
+      const connection = new FakeConnection()
+      connection.createPeer = () => testCase.created as PeerLike
+      const dispose = installAnonymousAdmit(connection)
+
+      const admission = connection.admit(request)
+      if (!('peer' in admission)) throw new Error('expected a peer')
+      expect(admission.peer.id).toBe('peer-1')
+      expect(connection.published).toHaveLength(1)
+      expect(errorMessages()).toHaveLength(1)
+      expect(errorMessages()[0]).toContain(testCase.detail)
+      expect(errorMessages()[0]).toContain('(falling back to publishPeer)')
+
+      dispose()
+      vi.restoreAllMocks()
+    }
+
+    // A dispose that throws must not escape the fallback path.
+    captureConsole()
+    const connection = new FakeConnection()
+    connection.createPeer = () => ({
+      id: '',
+      dispose: () => {
+        throw new Error('dispose exploded')
+      },
+    })
+    const dispose = installAnonymousAdmit(connection)
+    expect(() => connection.admit(request)).not.toThrow()
+    expect('peer' in connection.admit(request)).toBe(true)
+    dispose()
+  })
+
+  it('rejects a published record whose peer id is empty', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    connection.publishPeer = () => 'peer-1'
+    vi.spyOn(connection.peers, 'get').mockReturnValue({
+      peer: { id: '', dispose: vi.fn() },
+    } as unknown as PeerRecord)
+    const dispose = installAnonymousAdmit(connection)
+
+    expect(connection.admit(request)).toEqual({ rejection: 401 })
+    const lines = errorMessages()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('request path degraded: peer record —')
+    expect(lines[0]).toContain('record.peer.id is ""')
+
+    dispose()
+  })
+
+  it('activates on a createPeer-only build (no publishPeer, no peers)', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'publishPeer', {
+      value: undefined,
+      configurable: true,
+    })
+    Object.defineProperty(connection, 'peers', {
+      value: undefined,
+      configurable: true,
+    })
+    const peer: PeerLike = {
+      id: 'created-peer',
+      interactions: 'answer',
+      dispose: vi.fn(async () => {}),
+    }
+    connection.createPeer = () => peer
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(true)
+    expect(result.stage).toBeUndefined()
+    const first = connection.admit(request)
+    const second = connection.admit(request)
+    if (!('peer' in first) || !('peer' in second)) throw new Error('expected peers')
+    expect(first.peer.id).toBe('created-peer')
+    expect(second.peer).toBe(first.peer)
+    expect(errorSpy).not.toHaveBeenCalled()
+
+    result.dispose()
+    const disposePeer = peer.dispose
+    if (disposePeer === undefined) throw new Error('expected a dispose handle')
+    expect(disposePeer).toHaveBeenCalledOnce()
+  })
+
+  it('stays inert when neither createPeer nor publishPeer is available', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'publishPeer', {
+      value: undefined,
+      configurable: true,
+    })
+    Object.defineProperty(connection, 'createPeer', {
+      value: undefined,
+      configurable: true,
+    })
+
+    const result = installAnonymousAdmitResult(connection)
+
+    expect(result.installed).toBe(false)
+    expect(result.stage).toBe('connection.publishPeer')
+    expectActivationSkipped('connection.publishPeer')
+    expect(errorMessages().join('\n')).toContain('connection.createPeer is undefined')
+    expect(Object.hasOwn(connection, 'admit')).toBe(false)
+    expect(connection.published).toHaveLength(0)
+    result.dispose()
+  })
+})
+
 describe('plugin module', () => {
   it('exports a zero-config Cordis plugin shape', () => {
     expect(name).toBe('local-admission')
@@ -989,6 +1285,35 @@ describe('plugin module', () => {
     expect('peer' in connection.admit(crossOriginRequest)).toBe(true)
     // One shared peer: the second request reuses the answer peer.
     expect(connection.published).toHaveLength(1)
+  })
+
+  it('activates on a createPeer-only connection service', () => {
+    captureConsole()
+    const connection = new FakeConnection()
+    Object.defineProperty(connection, 'publishPeer', {
+      value: undefined,
+      configurable: true,
+    })
+    Object.defineProperty(connection, 'peers', {
+      value: undefined,
+      configurable: true,
+    })
+    connection.createPeer = () => ({
+      id: 'created-peer',
+      interactions: 'answer',
+      dispose: vi.fn(async () => {}),
+    })
+    const ctx = new FakeContext({ connection, webServer: loopback })
+
+    expect(() => apply(ctx as never)).not.toThrow()
+
+    // A build that only exposes createPeer is still fully covered.
+    expectActivated(ctx, connection)
+    expect(errorSpy).not.toHaveBeenCalled()
+    const admission = connection.admit(request)
+    if (!('peer' in admission)) throw new Error('expected a peer')
+    expect(admission.peer.id).toBe('created-peer')
+    expect(connection.peers).toBeUndefined()
   })
 
   it('skips activation when connection.publishPeer is missing', () => {

@@ -27,6 +27,16 @@
  * what shape the internal service has. A missing `authorizeIndex` or
  * `authorizeConnect` is not fatal: the other gates are still patched and only
  * the corresponding stock flow keeps asking for a token.
+ *
+ * Peer minting has two paths, tried in this order on the first admission:
+ * `createPeer({ principal: { kind: 'owner' }, interactions: 'answer' })`, then
+ * `publishPeer('answer')` + `peers.delete(id)`. A `createPeer` that throws, or
+ * that returns something unusable, is released (best-effort) and the request
+ * falls back to the registry path instead of answering 401 for the rest of the
+ * process. A Peer that a future `createPeer` mistakenly registers is removed
+ * from `peers` before it is handed out, because a registered Peer makes
+ * `admitConnection` claim exclusive socket ownership and answer 409 to every
+ * second upgrade.
  */
 import type { ConnectionTrustRequest } from '@deepseek-ai/dsh-client-connection'
 
@@ -90,16 +100,27 @@ export interface PatchableConnection {
    */
   isTrusted?(request: ConnectionTrustRequest): boolean
   /**
-   * Create an unregistered Peer owned by the service. Optional only because a
-   * dsh build may rename it; when absent the patch falls back to
-   * {@link PatchableConnection.publishPeer}.
+   * Create an unregistered Peer owned by the service. Preferred minting path;
+   * when absent the patch falls back to {@link PatchableConnection.publishPeer}
+   * plus {@link PatchableConnection.peers}. A build that only exposes this
+   * member is still enough to activate (see {@link probeConnection}).
    */
   createPeer?(options: {
     principal?: { kind: 'owner' }
     interactions?: ConnectionInteractions
   }): PeerLike
-  publishPeer(interactions?: ConnectionInteractions): string
-  peers: Map<string, PeerRecord>
+  /**
+   * Stock registry-backed publisher. Optional because a dsh build may rename
+   * it, and because a `createPeer`-only build never needs it.
+   */
+  publishPeer?(interactions?: ConnectionInteractions): string
+  /**
+   * The service's peer registry. Optional for the same reason as
+   * {@link PatchableConnection.publishPeer}; when it is a `Map` the patch both
+   * unregisters the fallback Peer and defends against a `createPeer` that
+   * registers its result.
+   */
+  peers?: Map<string, PeerRecord>
   readonly disposed?: boolean
 }
 
@@ -151,8 +172,13 @@ interface PatchState {
    * `admitConnection` never claims socket ownership for it.
    */
   sharedPeer: PeerLike | undefined
-  /** Last runtime error signature, used to throttle repeated request logs. */
-  lastErrorKey: string | undefined
+  /**
+   * Runtime error signatures already logged. Each distinct failure is reported
+   * once, so a permanently broken member cannot flood the dsh log on a busy
+   * port; the set is bounded because a hostile host could otherwise grow it
+   * without limit.
+   */
+  readonly loggedErrors: Set<string>
 }
 
 /** `admit` with its receiver typed, kept for exact restoration. */
@@ -283,7 +309,9 @@ function readPeerRecord(record: unknown): PeerLike {
   }
 
   const id = (peer as { id?: unknown }).id
-  if (typeof id !== 'string') {
+  // Same rule as {@link readPeerLike}: an empty id cannot key the registry, so
+  // a record that claims one is malformed rather than merely unusual.
+  if (typeof id !== 'string' || id === '') {
     throw new TypeError(`record.peer.id is ${describeValue(id)}`)
   }
 
@@ -324,11 +352,116 @@ function describeValue(value: unknown): string {
 }
 
 /**
+ * Best-effort Peer release shared by every disposal path.
+ *
+ * Used for the shared Peer on uninstall, for a `createPeer` result that turned
+ * out to be unusable, and for a minted Peer that a future build registered.
+ * Never throws: the peer may belong to a service that is already tearing down,
+ * `dispose` may be absent or not callable, and a returned thenable may reject
+ * long after the caller has moved on.
+ *
+ * @param peer - candidate Peer; non-objects are ignored.
+ */
+function releasePeer(peer: unknown): void {
+  if (peer === null || typeof peer !== 'object') return
+  try {
+    const dispose = (peer as { dispose?: unknown }).dispose
+    if (typeof dispose !== 'function') return
+    const result = (dispose as () => unknown).call(peer)
+    if (result !== null && typeof result === 'object') {
+      ;(result as PromiseLike<unknown>).then(undefined, () => {})
+    }
+  } catch {
+    // Release is best-effort by contract; a failure must not escape.
+  }
+}
+
+/** A minted Peer that had to be refused, and the stage that produced it. */
+interface RegistryConflict {
+  readonly stage: string
+  readonly error: unknown
+}
+
+/**
+ * Enforce the "never hand out a registered Peer" invariant.
+ *
+ * The whole point of the shared Peer is that it is invisible to
+ * `admitConnection`; a registered Peer is claimed exclusively (`ownsSocket`)
+ * and answers 409 to the next upgrade. Stock `createPeer` returns an
+ * unregistered Peer, but that is an implementation detail of one dsh build, so
+ * every minted Peer is checked against the live registry before use.
+ *
+ * A build without a `peers` Map has nothing that could claim ownership, so the
+ * check is skipped there. Every property read and call is guarded: a throwing
+ * getter or a hostile `Map` must degrade to a rejection, never escape into
+ * dsh's request handler.
+ *
+ * @param connection - patched service instance.
+ * @param peer - freshly minted Peer.
+ * @returns `undefined` when the Peer is (now) unregistered; otherwise the
+ *   stage and error to degrade with.
+ */
+function ensureUnregistered(
+  connection: PatchableConnection,
+  peer: PeerLike,
+): RegistryConflict | undefined {
+  try {
+    let registry: unknown
+    try {
+      registry = (connection as { peers?: unknown }).peers
+    } catch (error) {
+      return { stage: 'peers', error }
+    }
+    if (!(registry instanceof Map)) return undefined
+    const peers = registry as Map<string, PeerRecord>
+
+    let registered: unknown
+    try {
+      registered = peers.has(peer.id)
+    } catch (error) {
+      return { stage: 'peers.has', error }
+    }
+    if (!registered) return undefined
+
+    try {
+      peers.delete(peer.id)
+    } catch (error) {
+      return { stage: 'peers.delete', error }
+    }
+
+    // Do not trust `delete`'s return value: a silently failing registry would
+    // still hand dsh an exclusive owner, so re-read the invariant.
+    let stillRegistered: unknown
+    try {
+      stillRegistered = peers.has(peer.id)
+    } catch (error) {
+      return { stage: 'peers.has', error }
+    }
+    if (stillRegistered) {
+      return {
+        stage: 'peers.delete',
+        error: new TypeError(
+          `peers.delete left the minted peer ${describeValue(peer.id)} registered`,
+        ),
+      }
+    }
+    return undefined
+  } catch (error) {
+    return { stage: 'peers', error }
+  }
+}
+
+/**
  * Non-throwing preflight for the runtime members the patch depends on.
  *
  * The published type promises these, but a dsh upgrade can rename or hide an
  * internal symbol. Returning a structured result (instead of throwing) lets
  * `apply` log exactly which member broke and stay inert.
+ *
+ * Required: `admit`. Peer minting needs either `createPeer`, or both
+ * `publishPeer` and a `peers` Map. Neither combination present is fatal
+ * (fail-closed): the plugin stays inactive rather than admitting requests it
+ * cannot serve with a shared, unregistered Peer.
  *
  * `isTrusted` is deliberately not required: the override never calls it.
  *
@@ -367,19 +500,26 @@ function inspectConnection(connection: unknown): ConnectionProbe {
     }
   }
 
-  if (typeof candidate.publishPeer !== 'function') {
+  const hasCreatePeer = typeof candidate.createPeer === 'function'
+  const hasPublishPeer = typeof candidate.publishPeer === 'function'
+
+  // No way to mint a Peer at all: refuse to activate instead of handing dsh a
+  // gate that can only answer 401.
+  if (!hasCreatePeer && !hasPublishPeer) {
     return {
       ok: false,
       stage: 'connection.publishPeer',
-      detail: `expected a function, got ${describeValue(candidate.publishPeer)}`,
+      detail: `expected a function, got ${describeValue(candidate.publishPeer)} (and connection.createPeer is ${describeValue(candidate.createPeer)})`,
     }
   }
 
-  if (!(candidate.peers instanceof Map)) {
+  // `createPeer` needs no registry; the `publishPeer` path cannot unregister
+  // its Peer without one, so it is only usable together with a Map.
+  if (!hasCreatePeer && !(candidate.peers instanceof Map)) {
     return {
       ok: false,
       stage: 'connection.peers',
-      detail: `expected a Map, got ${describeValue(candidate.peers)}`,
+      detail: `expected a Map, got ${describeValue(candidate.peers)} (required when connection.createPeer is absent)`,
     }
   }
 
@@ -534,18 +674,163 @@ export function installAnonymousAdmitResult(
       original: connectMethod,
     },
     sharedPeer: undefined,
-    lastErrorKey: undefined,
+    loggedErrors: new Set<string>(),
   }
 
-  /** Log/return once per distinct runtime failure; never throws. */
-  const degrade = (stage: string, error: unknown): Admission => {
+  /**
+   * Claim the right to log one error signature.
+   *
+   * @param key - `<stage>:<detail>` signature.
+   * @returns `true` the first time this signature is seen.
+   */
+  const remember = (key: string): boolean => {
+    if (state.loggedErrors.has(key)) return false
+    if (state.loggedErrors.size >= 64) state.loggedErrors.clear()
+    state.loggedErrors.add(key)
+    return true
+  }
+
+  /** Log once per distinct runtime failure; never throws. */
+  const note = (stage: string, error: unknown): void => {
     const detail = describeError(error)
     const key = `${stage}:${detail}`
-    if (state.lastErrorKey !== key) {
-      state.lastErrorKey = key
-      safeError(requestDegraded(stage, detail))
-    }
+    if (remember(key)) safeError(requestDegraded(stage, detail))
+  }
+
+  /** Refuse the request, logging the failure once per signature. */
+  const degrade = (stage: string, error: unknown): Admission => {
+    note(stage, error)
     return { rejection: 401 }
+  }
+
+  /**
+   * Report an unusable `createPeer` once per distinct signature.
+   *
+   * Deliberately distinct from {@link requestDegraded}: the request is not
+   * rejected, it continues down the `publishPeer` path, so a line claiming
+   * "returning 401" would be a lie. Logging is throttled by the same
+   * {@link PatchState.loggedErrors} set as every other request-path failure, so
+   * a permanently broken `createPeer` cannot flood the log, while the first
+   * occurrence still names the cause.
+   */
+  const noteCreatePeerFallback = (error: unknown): void => {
+    const detail = describeError(error)
+    const key = `createPeer:${detail}`
+    if (!remember(key)) return
+    safeError(
+      `${LOG_PREFIX} createPeer path unusable: ${detail} (falling back to publishPeer)`,
+    )
+  }
+
+  /**
+   * Registry fallback: publish a Peer through the stock method, then unregister
+   * it before handing it out. Never throws.
+   */
+  const mintFromRegistry = (): Admission => {
+    let publishPeer: unknown
+    try {
+      publishPeer = (patched as { publishPeer?: unknown }).publishPeer
+    } catch (error) {
+      return degrade('publishPeer', error)
+    }
+    if (typeof publishPeer !== 'function') {
+      return degrade(
+        'publishPeer',
+        new TypeError(`publishPeer is ${describeValue(publishPeer)}, not a function`),
+      )
+    }
+
+    // Read the registry before publishing: a build without a Map cannot
+    // unregister the Peer, so publishing into it would create exactly the
+    // exclusive-owner Peer this plugin must avoid.
+    let registry: unknown
+    try {
+      registry = (patched as { peers?: unknown }).peers
+    } catch (error) {
+      return degrade('peers', error)
+    }
+    if (!(registry instanceof Map)) {
+      return degrade(
+        'peers',
+        new TypeError(`peers is ${describeValue(registry)}, not a Map`),
+      )
+    }
+    const peers = registry as Map<string, PeerRecord>
+
+    let peerId: string
+    try {
+      peerId = (publishPeer as PublishPeer).call(patched, 'answer')
+    } catch (error) {
+      return degrade('publishPeer', error)
+    }
+    if (typeof peerId !== 'string' || peerId === '') {
+      return degrade(
+        'publishPeer',
+        new TypeError(`publishPeer returned ${describeValue(peerId)} instead of an id`),
+      )
+    }
+
+    let record: PeerRecord | undefined
+    try {
+      record = peers.get(peerId)
+    } catch (error) {
+      return degrade('peers.get', error)
+    }
+
+    // The record lookup, the null check, and both property reads run inside one
+    // guard: `typeof null === 'object'` and throwing getters must degrade to 401
+    // instead of throwing into dsh's request handler.
+    let peer: PeerLike
+    try {
+      peer = readPeerRecord(record)
+    } catch (error) {
+      return degrade('peer record', error)
+    }
+
+    try {
+      peers.delete(peerId)
+    } catch (error) {
+      // A registry that cannot be unregistered still admits this peer, but
+      // `ownsSocket` would then serialise sockets. Release the Peer we just
+      // published and degrade, rather than leaving an owner behind.
+      releasePeer(peer)
+      return degrade('peers.delete', error)
+    }
+    let stillRegistered: unknown
+    try {
+      stillRegistered = peers.has(peerId)
+    } catch (error) {
+      releasePeer(peer)
+      return degrade('peers.has', error)
+    }
+    if (stillRegistered) {
+      // A delete that silently does nothing would still serve 409 to the next
+      // upgrade; fail closed instead of trusting the registry.
+      releasePeer(peer)
+      return degrade(
+        'peers.delete',
+        new TypeError(`peers.delete left ${describeValue(peerId)} registered`),
+      )
+    }
+
+    state.sharedPeer = peer
+    return { peer }
+  }
+
+  /**
+   * Bind `publishPeer` for the `/connect` override.
+   *
+   * @returns a callable publisher, or `undefined` on a build without one (the
+   *   redirect still answers; only the registry publication is skipped).
+   */
+  const readPublishPeer = (): PublishPeer | undefined => {
+    try {
+      const candidate = (patched as { publishPeer?: unknown }).publishPeer
+      if (typeof candidate !== 'function') return undefined
+      return (mode) => (candidate as PublishPeer).call(patched, mode)
+    } catch {
+      return undefined
+    }
   }
 
   /**
@@ -580,83 +865,60 @@ export function installAnonymousAdmitResult(
 
     // 2a. Preferred: mint an unregistered Peer exactly the way the stock
     //     `browserPeer` is built (`createPeer` is a public service method).
+    //     A build where `createPeer` is missing, throws, or returns garbage
+    //     falls through to the registry path **in the same request**; a broken
+    //     `createPeer` must not turn every admission into a 401.
     let createPeer: unknown
+    let createPeerReadError: unknown
     try {
       createPeer = (patched as { createPeer?: unknown }).createPeer
     } catch (error) {
-      return degrade('createPeer', error)
+      createPeerReadError = error
     }
-    if (typeof createPeer === 'function') {
+    if (createPeerReadError !== undefined) {
+      noteCreatePeerFallback(createPeerReadError)
+    } else if (typeof createPeer === 'function') {
       let created: unknown
+      let createdFailed = false
       try {
         created = (createPeer as (options: unknown) => unknown).call(patched, {
           principal: { kind: 'owner' },
           interactions: 'answer',
         })
       } catch (error) {
-        return degrade('createPeer', error)
+        createdFailed = true
+        noteCreatePeerFallback(error)
       }
-      if (created === null || typeof created !== 'object') {
-        return degrade(
-          'createPeer',
-          new TypeError(`createPeer returned ${describeValue(created)}`),
-        )
+      if (!createdFailed) {
+        let candidate: PeerLike | undefined
+        try {
+          candidate = readPeerLike(created)
+        } catch (error) {
+          // The Peer exists but is unusable (missing/empty id): release it
+          // before falling back, otherwise every request leaks one.
+          noteCreatePeerFallback(error)
+          releasePeer(created)
+        }
+        if (candidate !== undefined) {
+          // Defence in depth: a build whose `createPeer` registers its result
+          // would otherwise bring back the 409 exclusivity bug.
+          const conflict = ensureUnregistered(patched, candidate)
+          if (conflict !== undefined) {
+            releasePeer(candidate)
+            return degrade(conflict.stage, conflict.error)
+          }
+          state.sharedPeer = candidate
+          return { peer: candidate }
+        }
       }
-      try {
-        const candidate = readPeerLike(created)
-        state.sharedPeer = candidate
-        return { peer: candidate }
-      } catch (error) {
-        return degrade('createPeer', error)
-      }
     }
 
-    // 2b. Fallback for a dsh build without `createPeer`: publish through the
-    //     stock registry, then immediately unregister the Peer. The instance
-    //     keeps owning it (we dispose it on uninstall), while `admitConnection`
-    //     sees no record and therefore never claims socket ownership — the same
-    //     shape as `browserPeer`.
-    let peerId: string
-    try {
-      peerId = patched.publishPeer.call(patched, 'answer')
-    } catch (error) {
-      return degrade('publishPeer', error)
-    }
-    if (typeof peerId !== 'string' || peerId === '') {
-      return degrade(
-        'publishPeer',
-        new TypeError(`publishPeer returned ${describeValue(peerId)} instead of an id`),
-      )
-    }
-
-    let record: PeerRecord | undefined
-    try {
-      record = patched.peers.get(peerId)
-    } catch (error) {
-      return degrade('peers.get', error)
-    }
-
-    // The record lookup, the null check, and both property reads run inside one
-    // guard: `typeof null === 'object'` and throwing getters must degrade to 401
-    // instead of throwing into dsh's request handler.
-    let peer: PeerLike
-    try {
-      peer = readPeerRecord(record)
-    } catch (error) {
-      return degrade('peer record', error)
-    }
-
-    try {
-      patched.peers.delete(peerId)
-    } catch (error) {
-      // A registry that cannot be unregistered still admits this peer, but
-      // `ownsSocket` would then serialise sockets. Treat it as fatal so the
-      // caller gets a clear 401 instead of a UI that silently never connects.
-      return degrade('peers.delete', error)
-    }
-
-    state.sharedPeer = peer
-    return { peer }
+    // 2b. Fallback for a dsh build without a usable `createPeer`: publish
+    //     through the stock registry, then immediately unregister the Peer.
+    //     The instance keeps owning it (we dispose it on uninstall), while
+    //     `admitConnection` sees no record and therefore never claims socket
+    //     ownership — the same shape as `browserPeer`.
+    return mintFromRegistry()
   }
 
   /** Best-effort `writeHead` + `end` that never escapes the wrapper. */
@@ -720,11 +982,12 @@ export function installAnonymousAdmitResult(
 
       if (req?.method !== 'GET' || url.pathname !== '/connect') return false
 
-      const publisher: PublishPeer =
-        typeof publish === 'function'
-          ? publish
-          : (mode) => patched.publishPeer(mode)
-      publisher(interactions)
+      // A `createPeer`-only build has no registry publisher; the redirect is
+      // still correct because the mux mints its own shared Peer through
+      // `createPeer`, so skip publication instead of throwing.
+      const publisher: PublishPeer | undefined =
+        typeof publish === 'function' ? publish : readPublishPeer()
+      publisher?.(interactions)
 
       respond(response, 302, {
         'cache-control': 'no-store',
@@ -736,10 +999,7 @@ export function installAnonymousAdmitResult(
     } catch (error) {
       const detail = describeError(error)
       const key = `authorizeConnect:${detail}`
-      if (state.lastErrorKey !== key) {
-        state.lastErrorKey = key
-        safeError(requestDegraded('authorizeConnect', detail))
-      }
+      if (remember(key)) safeError(requestDegraded('authorizeConnect', detail))
       try {
         respond(response, 401, { 'cache-control': 'no-store' }, 'unauthorized')
       } catch {
@@ -826,16 +1086,8 @@ function makeDisposer(
 
       const shared = state.sharedPeer
       state.sharedPeer = undefined
-      if (shared !== undefined) {
-        try {
-          const result = shared.dispose?.()
-          if (result !== null && typeof result === 'object') {
-            ;(result as PromiseLike<void>).then(undefined, () => {})
-          }
-        } catch {
-          // The service may already be torn down.
-        }
-      }
+      // The service may already be torn down; release is best-effort.
+      if (shared !== undefined) releasePeer(shared)
 
       // The shared Peer is unregistered by design (see `admit`), so it is
       // released here instead of by `admitConnection` on socket close.
